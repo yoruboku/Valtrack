@@ -33,7 +33,6 @@ jobs:
           if ($env:GITHUB_REF -match '^refs/tags/(.+)') {
             $tag = $Matches[1]
           } else {
-            $date = Get-Date -Format "yyyyMMdd"
             $tag = "v0.1.$env:GITHUB_RUN_NUMBER"
           }
           Write-Output "tag=$tag" >> $env:GITHUB_OUTPUT
@@ -69,11 +68,30 @@ jobs:
 
       - name: Package portable executable & checksum
         run: |
-          $exe = Get-ChildItem -Path "src-tauri/target/release" -Filter "*.exe" -Exclude "*.pdb" | Select-Object -First 1
-          if (-not $exe) {
-            throw "Executable not found in src-tauri/target/release"
+          $candidates = @(
+            "src-tauri/target/release/valtrace.exe",
+            "src-tauri\target\release\valtrace.exe",
+            "src-tauri/target/release/Valtrace.exe",
+            "src-tauri\target\release\Valtrace.exe"
+          )
+          $found = $null
+          foreach ($p in $candidates) {
+            if (Test-Path $p) {
+              $found = (Resolve-Path $p).Path
+              break
+            }
           }
-          Copy-Item $exe.FullName "src-tauri/target/release/Valtrace.exe" -Force
+          if (-not $found) {
+            $item = Get-ChildItem -Path "src-tauri" -Filter "*.exe" -Recurse | Where-Object { $_.Name -like "*valtrace*.exe" -and $_.Name -notlike "*.pdb" } | Select-Object -First 1
+            if ($item) {
+              $found = $item.FullName
+            } else {
+              Get-ChildItem -Path "src-tauri" -Recurse | Select-Object FullName
+              throw "valtrace.exe not found in src-tauri"
+            }
+          }
+          Write-Output "Found binary at: $found"
+          Copy-Item $found "src-tauri/target/release/Valtrace.exe" -Force
           $hash = (Get-FileHash "src-tauri/target/release/Valtrace.exe" -Algorithm SHA256).Hash.ToLower()
           Set-Content -Path "src-tauri/target/release/Valtrace.exe.sha256" -Value $hash -NoNewline -Encoding ascii
           Write-Output "Executable SHA256: $hash"
