@@ -1,0 +1,65 @@
+import type { TrackerSnapshot } from "../ipc/types";
+import { isMultiTeam, partyGroups, splitTeams } from "../lib/players";
+import { gridTemplate, ROW_GRID, visibleColumns, type TableLayout } from "../lib/table";
+import { TeamBlock } from "./TeamBlock";
+import { Tooltip } from "./Tooltip";
+
+function Legend({ layout }: { layout: TableLayout }) {
+  return (
+    <div
+      style={{ gridTemplateColumns: layout.template }}
+      className={`${ROW_GRID} border-l-transparent pb-1 text-[9px] font-medium tracking-[0.14em] text-neutral-600 uppercase`}
+    >
+      {visibleColumns(layout.withSkins).map((column) => (
+        <Tooltip key={column.key} content={column.hint}>
+          <span className={column.left ? "" : "text-center"}>{column.label}</span>
+        </Tooltip>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The app: two team blocks, ally first, coloured by `isAlly` only. A multi-team mode is one
+ * flat block instead, still in backend order.
+ */
+export function PlayerTable({ snapshot }: { snapshot: TrackerSnapshot }) {
+  const pregame = snapshot.status === "Pregame";
+  const withSkins = snapshot.status === "Ingame";
+
+  const layout: TableLayout = {
+    template: gridTemplate(withSkins),
+    withSkins,
+    parties: partyGroups(snapshot.players),
+  };
+
+  if (isMultiTeam(snapshot.players)) {
+    return (
+      <div className="min-w-fit px-4 pt-2 pb-3">
+        <Legend layout={layout} />
+        <TeamBlock label="Players" players={snapshot.players} layout={layout} />
+      </div>
+    );
+  }
+
+  const { allies, enemies } = splitTeams(snapshot.players);
+  return (
+    <div className="min-w-fit px-4 pt-2 pb-3">
+      <Legend layout={layout} />
+      <TeamBlock
+        side="ally"
+        label={pregame ? "Your team · agent select" : "Your team"}
+        players={allies}
+        layout={layout}
+      />
+      {enemies.length > 0 && (
+        <TeamBlock side="enemy" label="Enemy team" players={enemies} layout={layout} />
+      )}
+      {pregame && (
+        <p className="mt-4 pl-2 text-[11px] text-neutral-600">
+          Riot hides the enemy team during agent select — they appear when the match starts.
+        </p>
+      )}
+    </div>
+  );
+}

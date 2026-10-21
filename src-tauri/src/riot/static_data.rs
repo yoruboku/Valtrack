@@ -1,0 +1,696 @@
+//! valorant-api.com static data: parsing + lookup + a version-keyed on-disk cache.
+//! Parsing/lookup functions are pure and fixture-testable; fetching/caching is IO.
+
+use crate::riot::constants::{PHANTOM_WEAPON_ID, VANDAL_WEAPON_ID};
+use crate::riot::error::{Error, Result};
+use crate::riot::rank::tier_name;
+use crate::riot::types::{AgentInfo, MapInfo, RankInfo, SkinInfo};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+
+/// Base URL for all static-data fetches.
+pub const VALORANT_API: &str = "https://valorant-api.com/v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MapStatic {
+    /// e.g. "/Game/Maps/Ascent/Ascent" — matched against coregame MapID (case-insensitive).
+    map_url: String,
+    display_name: String,
+    splash: Option<String>,
+    list_view_icon: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentStatic {
+    display_name: String,
+    display_icon: Option<String>,
+    /// valorant-api `isPlayableCharacter`. Non-playable entries stay in the map because some
+    /// modes put one on every player (Gauntlet: Glitched's draft agent).
+    playable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TierStatic {
+    small_icon: Option<String>,
+    large_icon: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SkinStatic {
+    display_name: String,
+    display_icon: Option<String>,
+    /// lowercased chroma uuid -> its own art, when it has any of its own.
+    #[serde(default)]
+    chromas: HashMap<String, Option<String>>,
+}
+
+/// Shape version of the cached blob. Bumped whenever a new mapping is added, so caches
+/// written by an older build are refetched instead of serving half the data.
+const CURRENT_STATIC_SCHEMA: u32 = 2;
+
+/// Cached, parsed static data for one game version.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StaticData {
+    pub version: String,
+    #[serde(default)]
+    schema: u32,
+    /// lowercased agent uuid -> agent.
+    agents: HashMap<String, AgentStatic>,
+    maps: Vec<MapStatic>,
+    /// CompetitiveTier number -> icons.
+    tiers: HashMap<u8, TierStatic>,
+    /// lowercased weapon-skin uuid -> name + icon (phase 2: Vandal/Phantom skins).
+    #[serde(default)]
+    skins: HashMap<String, SkinStatic>,
+}
+
+impl StaticData {
+    /// Whether every mapping actually got populated. Only a complete blob may reach the
+    /// version-keyed disk cache, and a cache file that fails this is treated as absent, so a
+    /// bad cache entry self-heals on the next fetch for that version.
+    pub fn is_complete(&self) -> bool {
+        self.schema == CURRENT_STATIC_SCHEMA
+            && !self.version.is_empty()
+            && !self.agents.is_empty()
+            && !self.maps.is_empty()
+            && !self.tiers.is_empty()
+            && !self.skins.is_empty()
+    }
+
+    /// Resolve an agent uuid (any case) to display-ready info. None -> None. An unknown uuid
+    /// counts as playable: nothing says otherwise.
+    pub fn agent(&self, character_id: Option<&str>) -> Option<AgentInfo> {
+        let id = character_id?.to_lowercase();
+        let a = self.agents.get(&id);
+        Some(AgentInfo {
+            id: id.clone(),
+            name: a.map(|a| a.display_name.clone()).unwrap_or_default(),
+            icon_url: a.and_then(|a| a.display_icon.clone()),
+            playable: a.is_none_or(|a| a.playable),
+        })
+    }
+
+    /// Resolve a coregame/pregame MapID path to display-ready info (case-insensitive).
+    pub fn map(&self, map_id: Option<&str>) -> Option<MapInfo> {
+        let id = map_id?;
+        let needle = id.to_lowercase();
+        let found = self.maps.iter().find(|m| m.map_url.to_lowercase() == needle);
+        Some(MapInfo {
+            id: id.to_string(),
+            name: found.map(|m| m.display_name.clone()).unwrap_or_default(),
+            splash_url: found.and_then(|m| m.splash.clone()),
+            list_view_url: found.and_then(|m| m.list_view_icon.clone()),
+        })
+    }
+
+    /// Resolve a weapon-skin uuid (any case) to display-ready info. `None` skin id -> None
+    /// (weapon not equipped / pregame). An unknown uuid still returns an entry with an empty
+    /// name so the UI can decide how to render it.
+    ///
+    /// `chroma_id` swaps in that colourway's art when it belongs to this skin and has art of
+    /// its own; any miss keeps the base icon. The name is always the base skin's — chromas
+    /// are variants of it, not separate skins.
+    pub fn skin(&self, skin_id: Option<&str>, chroma_id: Option<&str>) -> Option<SkinInfo> {
+        let id = skin_id?.to_lowercase();
+        let s = self.skins.get(&id);
+        let chroma_icon = chroma_id
+            .and_then(|c| s?.chromas.get(&c.to_lowercase()))
+            .cloned()
+            .flatten();
+        Some(SkinInfo {
+            name: s.map(|s| s.display_name.clone()).unwrap_or_default(),
+            icon_url: chroma_icon.or_else(|| s.and_then(|s| s.display_icon.clone())),
+        })
+    }
+
+    /// Resolve a CompetitiveTier number to a display rank (name + icon). Tier 0 goes through
+    /// the same table lookup as every other tier — the competitivetiers table carries a real
+    /// Unranked icon — and falls back to `RankInfo::unranked()` shape (name "Unranked", no
+    /// icon) when the table has no tier-0 entry.
+    pub fn rank(&self, tier: u8) -> RankInfo {
+        let icon_url = self
+            .tiers
+            .get(&tier)
+            .and_then(|t| t.large_icon.clone().or_else(|| t.small_icon.clone()));
+        if tier == 0 && icon_url.is_none() {
+            return RankInfo::unranked();
+        }
+        RankInfo { tier, name: tier_name(tier).to_string(), icon_url }
+    }
+}
+
+// --- pure parsers -----------------------------------------------------------
+
+/// Parse `data.riotClientVersion` from the `/version` payload.
+pub fn parse_version(value: &Value) -> Option<String> {
+    value
+        .get("data")?
+        .get("riotClientVersion")?
+        .as_str()
+        .map(String::from)
+}
+
+/// Parse the `/agents` payload into lowercased-uuid -> agent, non-playable entries included
+/// (flagged). A missing `isPlayableCharacter` counts as playable.
+fn parse_agents(value: &Value) -> HashMap<String, AgentStatic> {
+    let mut out = HashMap::new();
+    let Some(arr) = value.get("data").and_then(|d| d.as_array()) else {
+        return out;
+    };
+    for a in arr {
+        let Some(uuid) = a.get("uuid").and_then(|v| v.as_str()) else { continue };
+        out.insert(
+            uuid.to_lowercase(),
+            AgentStatic {
+                display_name: a
+                    .get("displayName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                display_icon: a.get("displayIcon").and_then(|v| v.as_str()).map(String::from),
+                playable: a.get("isPlayableCharacter").and_then(|v| v.as_bool()) != Some(false),
+            },
+        );
+    }
+    out
+}
+
+/// Parse the `/maps` payload into a list of maps.
+fn parse_maps(value: &Value) -> Vec<MapStatic> {
+    let Some(arr) = value.get("data").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|m| {
+            Some(MapStatic {
+                map_url: m.get("mapUrl").and_then(|v| v.as_str())?.to_string(),
+                display_name: m
+                    .get("displayName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                splash: m.get("splash").and_then(|v| v.as_str()).map(String::from),
+                list_view_icon: m.get("listViewIcon").and_then(|v| v.as_str()).map(String::from),
+            })
+        })
+        .filter(|m| !m.map_url.is_empty())
+        .collect()
+}
+
+/// Parse the `/competitivetiers` payload. Uses the LAST entry of the top-level `data`
+/// array (episode tier tables are appended chronologically -> newest is current).
+fn parse_competitive_tiers(value: &Value) -> HashMap<u8, TierStatic> {
+    let mut out = HashMap::new();
+    let Some(table) = value.get("data").and_then(|d| d.as_array()).and_then(|a| a.last()) else {
+        return out;
+    };
+    let Some(tiers) = table.get("tiers").and_then(|t| t.as_array()) else {
+        return out;
+    };
+    for t in tiers {
+        let Some(tier) = t.get("tier").and_then(|v| v.as_u64()) else { continue };
+        out.insert(
+            tier as u8,
+            TierStatic {
+                small_icon: t.get("smallIcon").and_then(|v| v.as_str()).map(String::from),
+                large_icon: t.get("largeIcon").and_then(|v| v.as_str()).map(String::from),
+            },
+        );
+    }
+    out
+}
+
+/// Parse the `/weapons` payload, keeping ONLY the Vandal + Phantom skins (matched by the
+/// parent weapon uuid) — the two rifles the table surfaces. Filtering by weapon here instead
+/// of storing all ~5k skins from `/weapons/skins` keeps the version-keyed disk cache tiny.
+/// Matching on the parent weapon (rather than a skin `assetPath` heuristic) is the robust
+/// route: the two weapons' `skins` arrays are exactly the skins we need. Some skins have a
+/// null top-level `displayIcon` (default/random skins); fall back to the first level's icon.
+/// Parse one skin's `chromas` array into lowercased chroma uuid -> art. `fullRender` is the
+/// chroma's own render; `displayIcon` is the fallback, and the base chroma of most skins has
+/// neither (it simply reuses the skin's icon) — stored as `None` so lookups fall back.
+fn parse_chromas(skin: &Value) -> HashMap<String, Option<String>> {
+    let mut out = HashMap::new();
+    let Some(arr) = skin.get("chromas").and_then(|c| c.as_array()) else {
+        return out;
+    };
+    for c in arr {
+        let Some(uuid) = c.get("uuid").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let icon = c
+            .get("fullRender")
+            .and_then(|v| v.as_str())
+            .or_else(|| c.get("displayIcon").and_then(|v| v.as_str()))
+            .map(String::from);
+        out.insert(uuid.to_lowercase(), icon);
+    }
+    out
+}
+
+fn parse_weapon_skins(value: &Value) -> HashMap<String, SkinStatic> {
+    let mut out = HashMap::new();
+    let Some(arr) = value.get("data").and_then(|d| d.as_array()) else {
+        return out;
+    };
+    for weapon in arr {
+        let Some(weapon_uuid) = weapon.get("uuid").and_then(|v| v.as_str()) else { continue };
+        let weapon_uuid = weapon_uuid.to_lowercase();
+        if weapon_uuid != VANDAL_WEAPON_ID && weapon_uuid != PHANTOM_WEAPON_ID {
+            continue;
+        }
+        let Some(skins) = weapon.get("skins").and_then(|s| s.as_array()) else { continue };
+        for s in skins {
+            let Some(uuid) = s.get("uuid").and_then(|v| v.as_str()) else { continue };
+            let display_icon = s
+                .get("displayIcon")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    s.get("levels")
+                        .and_then(|l| l.as_array())
+                        .and_then(|l| l.first())
+                        .and_then(|lvl| lvl.get("displayIcon"))
+                        .and_then(|v| v.as_str())
+                })
+                .map(String::from);
+            out.insert(
+                uuid.to_lowercase(),
+                SkinStatic {
+                    display_name: s
+                        .get("displayName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    display_icon,
+                    chromas: parse_chromas(s),
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Build `StaticData` from the already-fetched payloads. `weapons` is the `/weapons`
+/// payload (the Vandal + Phantom skins are extracted from it).
+pub fn build(
+    version: String,
+    agents: &Value,
+    maps: &Value,
+    tiers: &Value,
+    weapons: &Value,
+) -> StaticData {
+    StaticData {
+        version,
+        schema: CURRENT_STATIC_SCHEMA,
+        agents: parse_agents(agents),
+        maps: parse_maps(maps),
+        tiers: parse_competitive_tiers(tiers),
+        skins: parse_weapon_skins(weapons),
+    }
+}
+
+// --- IO: fetch + disk cache -------------------------------------------------
+
+/// Directory for the version-keyed static-data cache (`%LOCALAPPDATA%\...\static-cache`).
+fn cache_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    let mut p = std::path::PathBuf::from(base);
+    p.push("valorant-lightweight-tracker");
+    p.push("static-cache");
+    Some(p)
+}
+
+fn cache_file(version: &str) -> Option<std::path::PathBuf> {
+    let mut p = cache_dir()?;
+    // Sanitize version for use as a filename.
+    let safe: String = version
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    p.push(format!("static-{safe}.json"));
+    Some(p)
+}
+
+/// Load cached static data for `version` from disk, if present, valid AND complete. An
+/// incomplete file is reported as absent so the next fetch overwrites it.
+pub fn load_cache(version: &str) -> Option<StaticData> {
+    let path = cache_file(version)?;
+    let bytes = std::fs::read(path).ok()?;
+    let data: StaticData = serde_json::from_slice(&bytes).ok()?;
+    data.is_complete().then_some(data)
+}
+
+/// Persist static data to the version-keyed cache file.
+pub fn save_cache(data: &StaticData) -> Result<()> {
+    if let Some(dir) = cache_dir() {
+        std::fs::create_dir_all(&dir)?;
+    }
+    if let Some(path) = cache_file(&data.version) {
+        let bytes = serde_json::to_vec(data)?;
+        std::fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
+/// Whether `file_name` is a static-cache file for some version other than the one in use
+/// (`keep`, itself a file name). Only files this module writes are ever touched. Pure.
+fn is_stale_cache_file(file_name: &str, keep: &str) -> bool {
+    file_name != keep && file_name.starts_with("static-") && file_name.ends_with(".json")
+}
+
+/// Delete the cache files of every version but `version`, so a patched client doesn't leave its
+/// predecessors' blobs on disk forever. Best-effort: any failure just leaves the file there.
+fn prune_cache(version: &str) {
+    let (Some(dir), Some(keep)) = (cache_dir(), cache_file(version)) else {
+        return;
+    };
+    let Some(keep) = keep.file_name().and_then(|n| n.to_str()).map(String::from) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_str().is_some_and(|n| is_stale_cache_file(n, &keep)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether a valorant-api payload carries a usable, non-empty `data` array. A JSON error body
+/// (429/5xx) has no such array, and an empty one means the endpoint answered with nothing
+/// worth caching. Pure — testable.
+fn has_data_array(value: &Value) -> bool {
+    value.get("data").and_then(|d| d.as_array()).is_some_and(|a| !a.is_empty())
+}
+
+/// GET one valorant-api path, rejecting a non-2xx status so an error body can never be parsed
+/// as a payload and cached under a valid version.
+async fn fetch_json(client: &reqwest::Client, path: &str) -> Result<Value> {
+    let resp = client.get(format!("{VALORANT_API}/{path}")).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(Error::Http(format!("valorant-api /{path} status {}", status.as_u16())));
+    }
+    Ok(resp.json().await?)
+}
+
+/// `fetch_json` plus the payload-sanity check for the list endpoints.
+async fn fetch_list(client: &reqwest::Client, path: &str) -> Result<Value> {
+    let body = fetch_json(client, path).await?;
+    if !has_data_array(&body) {
+        return Err(Error::MalformedPayload(format!("valorant-api /{path} returned no data")));
+    }
+    Ok(body)
+}
+
+/// Fetch just `riotClientVersion` — the bootstrap value for the remote request headers and the
+/// key the static cache is stored under. Kept separate so a session whose full static fetch
+/// failed can still send a valid client version.
+pub async fn fetch_version(client: &reqwest::Client) -> Result<String> {
+    let version_json = fetch_json(client, "version").await?;
+    match parse_version(&version_json) {
+        Some(v) if !v.is_empty() => Ok(v),
+        _ => Err(Error::MalformedPayload(
+            "valorant-api /version has no riotClientVersion".into(),
+        )),
+    }
+}
+
+/// Fetch + parse all static data from valorant-api.com, using the disk cache when the
+/// version already matches. `client` is an ordinary reqwest client (public host, valid TLS).
+/// Any failed or empty endpoint fails the whole fetch and writes NOTHING to the cache, so a
+/// bad patch-day response can't leave empty mappings pinned to a valid version; the
+/// caller degrades to unresolved names/icons and a later attempt fills them in.
+pub async fn fetch(client: &reqwest::Client) -> Result<StaticData> {
+    let version = fetch_version(client).await?;
+
+    if let Some(cached) = load_cache(&version) {
+        prune_cache(&version);
+        return Ok(cached);
+    }
+
+    let agents = fetch_list(client, "agents").await?;
+    let maps = fetch_list(client, "maps").await?;
+    let tiers = fetch_list(client, "competitivetiers").await?;
+    // `/weapons` (not `/weapons/skins`) so we can filter to just the Vandal + Phantom skins
+    // by their parent weapon uuid — far smaller than the ~5k-entry full skin list.
+    let weapons = fetch_list(client, "weapons").await?;
+
+    let data = build(version, &agents, &maps, &tiers, &weapons);
+    // A payload that parsed to nothing usable (shape change, filtered-away skins) is as bad as
+    // a failed fetch: don't cache it.
+    if !data.is_complete() {
+        return Err(Error::MalformedPayload("valorant-api payloads parsed to empty mappings".into()));
+    }
+    let _ = save_cache(&data); // best-effort cache write
+    prune_cache(&data.version);
+    Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_version() {
+        let v = json!({ "data": { "riotClientVersion": "release-13.04-shipping-18-5304478" } });
+        assert_eq!(parse_version(&v).as_deref(), Some("release-13.04-shipping-18-5304478"));
+    }
+
+    #[test]
+    fn resolves_agent_case_insensitively() {
+        let agents = json!({ "data": [
+            { "uuid": "ADD6443A-41BD-E414-F6AD-E58D267F4E95", "displayName": "Reyna",
+              "displayIcon": "https://x/reyna.png", "isPlayableCharacter": true }
+        ]});
+        let data = build("v".into(), &agents, &json!({}), &json!({}), &json!({}));
+        let a = data.agent(Some("add6443a-41bd-e414-f6ad-e58d267f4e95")).unwrap();
+        assert_eq!(a.name, "Reyna");
+        assert_eq!(a.icon_url.as_deref(), Some("https://x/reyna.png"));
+        // unknown agent still returns id with empty name.
+        let unknown = data.agent(Some("deadbeef")).unwrap();
+        assert_eq!(unknown.name, "");
+        assert!(unknown.icon_url.is_none());
+        assert!(data.agent(None).is_none());
+    }
+
+    #[test]
+    fn keeps_non_playable_agents_flagged() {
+        let agents = json!({ "data": [
+            { "uuid": "773F0C78-4486-752B-68EF-4585D7F4B848", "displayName": "KAY/O",
+              "displayIcon": "https://x/draft.png", "isPlayableCharacter": false },
+            { "uuid": "reyna", "displayName": "Reyna", "isPlayableCharacter": true },
+            { "uuid": "unflagged", "displayName": "Jett" }
+        ]});
+        let data = build("v".into(), &agents, &json!({}), &json!({}), &json!({}));
+        let draft = data.agent(Some("773f0c78-4486-752b-68ef-4585d7f4b848")).unwrap();
+        assert_eq!(draft.name, "KAY/O");
+        assert_eq!(draft.icon_url.as_deref(), Some("https://x/draft.png"));
+        assert!(!draft.playable);
+        assert!(data.agent(Some("reyna")).unwrap().playable);
+        assert!(data.agent(Some("unflagged")).unwrap().playable);
+        assert!(data.agent(Some("unknown")).unwrap().playable);
+    }
+
+    #[test]
+    fn resolves_map_by_url_case_insensitive() {
+        let maps = json!({ "data": [
+            { "uuid": "m1", "mapUrl": "/Game/Maps/Ascent/Ascent", "displayName": "Ascent",
+              "splash": "https://x/splash.png", "listViewIcon": "https://x/list.png" }
+        ]});
+        let data = build("v".into(), &json!({}), &maps, &json!({}), &json!({}));
+        let m = data.map(Some("/game/maps/ascent/ascent")).unwrap();
+        assert_eq!(m.name, "Ascent");
+        assert_eq!(m.splash_url.as_deref(), Some("https://x/splash.png"));
+    }
+
+    #[test]
+    fn picks_last_competitive_tier_table() {
+        let tiers = json!({ "data": [
+            { "tiers": [ { "tier": 27, "tierName": "OLD", "largeIcon": "old.png" } ] },
+            { "tiers": [ { "tier": 27, "tierName": "RADIANT", "smallIcon": "s.png", "largeIcon": "new.png" } ] }
+        ]});
+        let data = build("v".into(), &json!({}), &json!({}), &tiers, &json!({}));
+        let r = data.rank(27);
+        assert_eq!(r.name, "Radiant");
+        assert_eq!(r.icon_url.as_deref(), Some("new.png")); // from the LAST table
+    }
+
+    #[test]
+    fn resolves_skin_case_insensitively_with_icon_fallback() {
+        // `/weapons` shape: each weapon carries its own `skins` array. Only the Vandal +
+        // Phantom weapons' skins are kept; every other weapon's skins are filtered out.
+        let weapons = json!({ "data": [
+            { "uuid": VANDAL_WEAPON_ID, "displayName": "Vandal", "skins": [
+                { "uuid": "DB91451C-4309-2C8C-EDED-BF842D844E52", "displayName": "Neptune Vandal",
+                  "displayIcon": "https://x/neptune.png" },
+                // default skin: null top-level displayIcon, icon in levels[0]
+                { "uuid": "fallback-skin", "displayName": "Standard Vandal", "displayIcon": null,
+                  "levels": [ { "displayIcon": "https://x/standard.png" } ] }
+            ]},
+            { "uuid": PHANTOM_WEAPON_ID, "displayName": "Phantom", "skins": [
+                { "uuid": "reaver-phantom", "displayName": "Reaver Phantom",
+                  "displayIcon": "https://x/reaver.png" }
+            ]},
+            // a non-rifle weapon whose skins must be filtered out.
+            { "uuid": "some-sheriff-weapon", "displayName": "Sheriff", "skins": [
+                { "uuid": "ignored-skin", "displayName": "Ignore Me", "displayIcon": "https://x/i.png" }
+            ]}
+        ]});
+        let data = build("v".into(), &json!({}), &json!({}), &json!({}), &weapons);
+        let van = data.skin(Some("db91451c-4309-2c8c-eded-bf842d844e52"), None).unwrap();
+        assert_eq!(van.name, "Neptune Vandal");
+        assert_eq!(van.icon_url.as_deref(), Some("https://x/neptune.png"));
+        // level fallback for a null top-level icon.
+        let fb = data.skin(Some("fallback-skin"), None).unwrap();
+        assert_eq!(fb.icon_url.as_deref(), Some("https://x/standard.png"));
+        // phantom skin kept too.
+        assert_eq!(data.skin(Some("reaver-phantom"), None).unwrap().name, "Reaver Phantom");
+        // a non-Vandal/Phantom weapon's skin is filtered out -> resolves to an empty entry.
+        assert_eq!(data.skin(Some("ignored-skin"), None).unwrap().name, "");
+        // unknown uuid -> empty name, no icon.
+        let unknown = data.skin(Some("nope"), None).unwrap();
+        assert_eq!(unknown.name, "");
+        assert!(unknown.icon_url.is_none());
+        // None -> None.
+        assert!(data.skin(None, None).is_none());
+    }
+
+    #[test]
+    fn chroma_overrides_the_icon_but_never_the_name() {
+        let weapons = json!({ "data": [
+            { "uuid": VANDAL_WEAPON_ID, "skins": [
+                { "uuid": "neptune", "displayName": "Neptune Vandal",
+                  "displayIcon": "https://x/neptune.png", "chromas": [
+                      { "uuid": "c-base", "fullRender": null, "displayIcon": null },
+                      { "uuid": "C-RED", "fullRender": "https://x/neptune-red.png" },
+                      { "uuid": "c-blue", "displayIcon": "https://x/neptune-blue.png" }
+                  ]},
+                { "uuid": "reaver", "displayName": "Reaver Vandal",
+                  "displayIcon": "https://x/reaver.png" }
+            ]}
+        ]});
+        let data = build("v".into(), &json!({}), &json!({}), &json!({}), &weapons);
+        // chroma art wins, base name stays.
+        let red = data.skin(Some("neptune"), Some("c-red")).unwrap();
+        assert_eq!(red.name, "Neptune Vandal");
+        assert_eq!(red.icon_url.as_deref(), Some("https://x/neptune-red.png"));
+        // fullRender absent -> the chroma's displayIcon.
+        assert_eq!(
+            data.skin(Some("neptune"), Some("c-blue"))
+                .unwrap()
+                .icon_url
+                .as_deref(),
+            Some("https://x/neptune-blue.png")
+        );
+        // chroma with no art of its own -> base icon.
+        assert_eq!(
+            data.skin(Some("neptune"), Some("c-base"))
+                .unwrap()
+                .icon_url
+                .as_deref(),
+            Some("https://x/neptune.png")
+        );
+        // unknown chroma -> base icon.
+        assert_eq!(
+            data.skin(Some("neptune"), Some("nope"))
+                .unwrap()
+                .icon_url
+                .as_deref(),
+            Some("https://x/neptune.png")
+        );
+        // a chroma belonging to a different skin -> base icon.
+        assert_eq!(
+            data.skin(Some("reaver"), Some("c-red"))
+                .unwrap()
+                .icon_url
+                .as_deref(),
+            Some("https://x/reaver.png")
+        );
+        // no chroma -> base icon, as before.
+        assert_eq!(
+            data.skin(Some("neptune"), None)
+                .unwrap()
+                .icon_url
+                .as_deref(),
+            Some("https://x/neptune.png")
+        );
+        // an unknown skin stays unresolved whatever the chroma.
+        assert!(data
+            .skin(Some("nope"), Some("c-red"))
+            .unwrap()
+            .icon_url
+            .is_none());
+    }
+
+    #[test]
+    fn tier_zero_is_unranked_with_the_tables_icon_if_any() {
+        let tiers = json!({ "data": [
+            { "tiers": [ { "tier": 0, "tierName": "UNRANKED", "smallIcon": null,
+                           "largeIcon": "https://x/unranked.png" } ] }
+        ]});
+        for (data, icon_url) in [
+            (build("v".into(), &json!({}), &json!({}), &tiers, &json!({})), Some("https://x/unranked.png")),
+            (StaticData::default(), None),
+        ] {
+            let expected = RankInfo { icon_url: icon_url.map(String::from), ..RankInfo::unranked() };
+            assert_eq!(data.rank(0), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_payloads_without_a_usable_data_array() {
+        // A JSON error body (429/5xx) or an empty list must never reach the cache.
+        assert!(!has_data_array(&json!({ "status": 429, "error": "rate limited" })));
+        assert!(!has_data_array(&json!({ "data": [] })));
+        assert!(!has_data_array(&json!({ "data": { "riotClientVersion": "x" } })));
+        assert!(!has_data_array(&json!({})));
+        assert!(has_data_array(&json!({ "data": [ { "uuid": "a" } ] })));
+    }
+
+    #[test]
+    fn only_a_full_current_schema_blob_is_complete() {
+        // A blob missing any mapping is treated as absent on load, which self-heals a
+        // poisoned cache file on the next fetch.
+        assert!(!StaticData::default().is_complete());
+        let agents = json!({ "data": [
+            { "uuid": "a", "displayName": "Reyna", "isPlayableCharacter": true }
+        ]});
+        let maps = json!({ "data": [ { "mapUrl": "/Game/Maps/Ascent/Ascent", "displayName": "Ascent" } ]});
+        let tiers = json!({ "data": [ { "tiers": [ { "tier": 27, "largeIcon": "n.png" } ] } ]});
+        let weapons = json!({ "data": [
+            { "uuid": VANDAL_WEAPON_ID, "skins": [ { "uuid": "s", "displayName": "Neptune" } ] }
+        ]});
+        // Every payload present but one -> still incomplete.
+        assert!(!build("v".into(), &json!({}), &maps, &tiers, &weapons).is_complete());
+        assert!(!build("v".into(), &agents, &json!({}), &tiers, &weapons).is_complete());
+        assert!(!build("v".into(), &agents, &maps, &json!({}), &weapons).is_complete());
+        assert!(!build("v".into(), &agents, &maps, &tiers, &json!({})).is_complete());
+        // An unnamed version is unusable as a cache key.
+        assert!(!build(String::new(), &agents, &maps, &tiers, &weapons).is_complete());
+        // All four present -> cacheable.
+        let mut old = build("v".into(), &agents, &maps, &tiers, &weapons);
+        assert!(old.is_complete());
+        // A blob written before the schema field existed deserializes to 0 -> refetched.
+        old.schema = 0;
+        assert!(!old.is_complete());
+        // Schema 1 filtered non-playable agents out, so it lacks the draft agent -> refetched.
+        old.schema = 1;
+        assert!(!old.is_complete());
+    }
+
+    #[test]
+    fn pruning_keeps_the_current_version_and_only_touches_our_own_files() {
+        let keep = "static-release-13.04.json";
+        assert!(!is_stale_cache_file(keep, keep));
+        assert!(is_stale_cache_file("static-release-13.03.json", keep));
+        // Anything this module didn't write is left alone.
+        assert!(!is_stale_cache_file("notes.txt", keep));
+        assert!(!is_stale_cache_file("static-release-13.03.json.bak", keep));
+        assert!(!is_stale_cache_file("other-13.03.json", keep));
+    }
+}

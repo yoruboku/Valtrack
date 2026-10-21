@@ -1,0 +1,396 @@
+# IPC Contract (Rust backend ↔ React frontend)
+
+Last updated: 2026-10-11 (snapshot `server` + `region`).
+Status: backend implemented; this is the
+exact TypeScript-facing contract the UI agent builds against. Everything the frontend
+receives is already display-ready — no Riot-API-shape interpretation happens in the UI.
+
+The backend exposes **five Tauri commands** (two for the tracker, two for the auto-updater,
+one for the diagnostics report) and emits **one Tauri event**. All payloads are `serde`-serialized with `camelCase` field
+names.
+
+---
+
+## Commands
+
+Invoke via `@tauri-apps/api/core`'s `invoke`.
+
+### `start_tracker`
+
+```ts
+import { invoke } from "@tauri-apps/api/core";
+await invoke("start_tracker"); // returns void
+```
+
+Starts the background loop (connect when Valorant appears, reconnect on loss, emit on every
+change). **Idempotent** — call it once on app mount; repeat calls are no-ops. Call this
+before (or right after) subscribing to the event.
+
+### `get_tracker_state`
+
+```ts
+const snapshot = await invoke<TrackerSnapshot>("get_tracker_state");
+```
+
+Returns the current `TrackerSnapshot` on demand (same shape the event carries). Use it once
+on mount to render immediately without waiting for the next event.
+
+### `get_diagnostics`
+
+```ts
+interface UiFacts { screen: string; heldTable: boolean }
+const report = await invoke<string>("get_diagnostics", { ui });
+```
+
+Returns a **preformatted plain-text report** of what the tracker last saw at each stage
+(lockfile, local API, own presence, remote hosts, websocket), for the user to paste into a
+GitHub issue. `ui` carries the two things only the frontend knows: `screen` is the line the
+user is looking at (which is what says what is on screen), `heldTable` whether a finished
+match's table is retained and can be viewed.
+
+The text layout is **not** a contract: it is meant to be read by a human, and it changes
+whenever a new failure mode is worth naming. What is guaranteed:
+
+- It **never** contains the lockfile password, an access/entitlements token, the private
+  presence blob, a full puuid or match id (both are cut to 8 characters), a full URL, or any
+  filesystem path (the lockfile path is printed unexpanded, so no Windows username appears).
+- Every error in it has gone through one redaction step that strips URLs and bounds the
+  length, so a transport error carrying a puuid in its URL cannot leak one.
+- It is available in **release builds too** — it is the release counterpart of the dev
+  console log.
+
+Reads the current state and returns; it does no IO and **never rejects in practice**. Available
+from the moment the app starts, before `start_tracker` has resolved anything.
+
+### `check_update`
+
+```ts
+const info = await invoke<{ available: boolean; version: string }>("check_update");
+```
+
+Asks GitHub for the latest release. `version` is the tag without its `v`; `available` is true
+only when it is numerically newer than the running build. **Rejects** (with a display-ready
+message) when the app is offline, rate-limited, the release carries no installable assets, or
+its tag is not a plain `vX.Y.Z` — the frontend turns that into its `error` state. See
+`docs/release.md` for the mechanics.
+
+### `apply_update`
+
+```ts
+await invoke("apply_update"); // returns void, and the app quits
+```
+
+Downloads the latest release (only when its tag is a readable version strictly newer than the
+running build), verifies its SHA-256, swaps it in beside the running exe and relaunches. On
+success the app exits, so this call never resolves; it **rejects** with a display-ready message
+ending in "download the new version manually" — guaranteed for every failure, the wording is
+appended at the command boundary — and the current install is left working.
+
+Two failures say more than that, because the install did move: if the swap could not be undone
+the message names the `valorant-lightweight-tracker.exe.old` file the user has to rename back,
+and if only the relaunch failed the message says the new version is already installed and
+starting the app again runs it. The frontend keeps the "update available" result standing after
+a rejection so the user can try again.
+
+---
+
+## Event
+
+Name: **`tracker-state`**. Payload: a `TrackerSnapshot` (below). Emitted on every resolved
+state change (dedup'd — identical snapshots are not re-emitted).
+
+**Incremental snapshots at match start.** Entering Pregame or Ingame fires a **series** of
+events for the same match: the per-player stats take several seconds of sequential fetching,
+so instead of waiting for a phase to finish the backend republishes the table as each stat
+settles, and every row says which of its stat groups are still coming (`pending`).
+
+The series is:
+
+1. **First paint** — as soon as the batch name resolution lands: `status`, `map`, `mode`,
+   `ownTeam`, and one row per player with `name`, `agent`, `accountLevel`, `partyId` and
+   `team`/`isAlly`/`isSelf`. Everything else is still empty, with `pending.rank`,
+   `pending.history`, `pending.recentStats` (and `pending.skins`, Ingame) set.
+2. **Progress snapshots** — one per settled stat, coalesced to at most one event per
+   **250 ms**, with a forced flush at each phase boundary. Ranks/RR/peak/WR clear
+   `pending.rank` per row as each MMR lands; ΔRR and the last-5 pips clear `pending.history`;
+   HS% and KD clear `pending.recentStats`; the Ingame loadouts clear `pending.skins` for the
+   whole roster at once.
+3. **Final snapshot** — `enriched: true`, every `pending` flag false.
+
+Rows the backend already holds data for (a same-match rebuild, a Pregame→Ingame upgrade, a
+resumed or retried enrichment) arrive filled in from the first paint. Values that are present
+are real — never partial or provisional.
+
+**The pending rule: a cell shows a skeleton iff its group's `pending` flag is true. A
+`null`/empty value with the flag false is final — render the "N/A" placeholder.** Never gate
+cells on `enriched`: it is a whole-snapshot summary, guaranteed to be `true` only when no row
+carries any pending flag, so it can say "everything settled" but never which cells are still
+loading. It is `true` on the final snapshot of a match, on re-entry to an already-loaded match,
+and on all non-match states.
+
+One bounded exception: if enrichment keeps failing (a player's stat fetches failing transiently,
+or an error that aborts the build), the backend retries a few times (publishing further
+`enriched: false` snapshots, those rows still pending), then gives up for that lobby and
+publishes `enriched: true` with the residual nulls
+and no pending flags — so a null there means "no data obtainable this match", which the UI
+renders as N/A either way.
+
+Re-entering an already-loaded match (the score changes each round) emits a **single**
+already-final snapshot. A Pregame→Ingame transition re-runs the series for the now-visible
+enemy team. All of this rides the existing dedup (a step that changed nothing is suppressed),
+so listeners need no special handling beyond expecting stats to arrive on a later event than
+the row itself.
+
+```ts
+import { listen } from "@tauri-apps/api/event";
+
+const unlisten = await listen<TrackerSnapshot>("tracker-state", (event) => {
+  const snapshot = event.payload;
+  // re-render
+});
+// later: unlisten();
+```
+
+Recommended startup sequence:
+
+```ts
+await invoke("start_tracker");
+const initial = await invoke<TrackerSnapshot>("get_tracker_state");
+render(initial);
+const unlisten = await listen<TrackerSnapshot>("tracker-state", (e) => render(e.payload));
+```
+
+---
+
+## Types
+
+```ts
+type AppStatus =
+  | "ValorantNotRunning" // lockfile missing, client not running, or connection lost
+  | "Menus"              // in menus, no active match
+  | "Pregame"            // agent select (only your own team is visible)
+  | "Ingame";            // live match (full roster)
+
+interface TrackerSnapshot {
+  status: AppStatus;
+  map: MapInfo | null;          // resolved map; null in Menus / ValorantNotRunning
+  mode: string | null;          // display mode name (see below); null outside a match
+  server: string | null;        // game server label, e.g. "US West (N. California)"; null
+                                // outside a match or when the payload has no readable pod id
+  region: string | null;        // upper-case region code ("NA", "EU", "AP", "KR", "LATAM",
+                                // "BR"); null outside a match. Diagnostics/future use only
+  ownTeam: string | null;       // local player's team id ("Red"|"Blue"); null outside a match
+  players: PlayerRow[];         // [] in Menus / ValorantNotRunning
+  enriched: boolean;            // every stat has settled. Guaranteed: true implies no row
+                                // carries a pending flag. A summary, NOT a per-cell gate —
+                                // key skeletons on PlayerRow.pending instead
+  lastUpdated: number;          // epoch milliseconds this snapshot was produced
+  message: string | null;       // optional status line, e.g. "Waiting for Valorant..."
+}
+
+interface MapInfo {
+  id: string;                   // raw MapID path, e.g. "/Game/Maps/Ascent/Ascent"
+  name: string;                 // "Ascent" ("" if unresolved from static data)
+  splashUrl: string | null;     // valorant-api splash image URL
+  listViewUrl: string | null;   // valorant-api list-view icon URL
+}
+
+interface PlayerRow {
+  id: string;                   // puuid — a stable, opaque React key only
+  name: string | null;          // "GameName#TagLine", or null when hidden (incognito) / unresolved
+  incognito: boolean;           // player enabled streamer/incognito mode — do NOT de-anonymize
+  team: string;                 // raw team id ("Red"|"Blue")
+  isAlly: boolean;              // on the local player's team (multi-team: in their group)
+  group: number | null;         // multi-team modes only (more than two sides, e.g. duos):
+                                // the side this player is on, from 1. null in two-team modes
+  isSelf: boolean;              // this row is the local player
+  agent: AgentInfo | null;      // null when not yet selected (pregame) / unresolved
+  agentSelectionState: string | null; // pregame only; Riot's raw CharacterSelectionState
+                                       // passed through. Known values "locked" | "selected";
+                                       // other strings possible. null outside pregame
+  currentRank: RankInfo;        // current competitive rank
+  rr: number;                   // ranked rating; 0–100 below Immortal (0 when unranked),
+                                // uncapped for Immortal+ (Riot's RankedRating passthrough)
+  leaderboardRank: number;      // leaderboard position; nonzero only for Ascendant+ top players
+  peakRank: RankInfo;           // highest rank across all recorded seasons
+  peakRankAct: string | null;   // act the peak was set in: "E6: A3", "V26: A1"; null when no
+                                // season could be attributed to the peak
+  accountLevel: number | null;  // null when hidden from this viewer (see rules below)
+  partyId: string | null;       // grouping id; set only when the player is in a party of >1
+  pending: PendingStats;        // which of this row's stat groups are still loading
+
+  // --- Per-player stats (fetched after the first paint) ---
+  winRate: WinRate | null;      // current-season WR; null when 0 games this season
+  rrChange: number | null;      // ΔRR of the player's newest competitive match; null if none
+  recentResults: MatchResult[]; // up to 5 recent comp results, newest first; [] when none
+  headshotPercent: number | null; // HS% over recent comp matches (0–100); null when "N/a"
+  kd: number | null;            // kills/deaths over the same recent comp matches, 2 decimals;
+                                // null when those matches carry no stats for the player
+  statsMatches: number | null;  // matches HS%/KD were computed from (5 when full, fewer when
+                                // partial); null when both are null
+  vandalSkin: SkinInfo | null;  // equipped Vandal skin; null in Pregame / Menus
+  phantomSkin: SkinInfo | null; // equipped Phantom skin; null in Pregame / Menus
+}
+
+interface PendingStats {       // true = still loading (skeleton); false = settled
+  name: boolean;                // `name`
+  rank: boolean;                // `currentRank`, `rr`, `leaderboardRank`, `peakRank`,
+                                // `peakRankAct`, `winRate` — all one MMR payload
+  history: boolean;             // `rrChange`, `recentResults`
+  recentStats: boolean;         // `headshotPercent`, `kd`, `statsMatches`
+  skins: boolean;               // `vandalSkin`, `phantomSkin` (Ingame only; settles for the
+                                // whole roster at once)
+}
+
+interface WinRate {
+  percent: number;              // wins/games*100, rounded int (the "57" in vRY "57 (14)")
+  games: number;                // competitive games this season (the "(14)")
+}
+
+type MatchResult = "Win" | "Loss" | "Draw" | "Unknown"; // "Draw" only from match-details;
+                                                        // "Unknown" = 0-RR match without them
+
+interface SkinInfo {
+  name: string;                 // "Neptune Vandal" ("" if unresolved)
+  iconUrl: string | null;       // valorant-api displayIcon URL
+}
+
+interface AgentInfo {
+  id: string;                   // agent uuid (lowercased)
+  name: string;                 // "Jett" ("" if unresolved)
+  iconUrl: string | null;       // valorant-api displayIcon URL
+  playable: boolean;            // valorant-api isPlayableCharacter; true when unresolved
+}
+
+interface RankInfo {
+  tier: number;                 // CompetitiveTier number (0 = Unranked)
+  name: string;                 // "Immortal 2", "Unranked", ...
+  iconUrl: string | null;       // competitivetiers large/small icon URL; null for Unranked
+}
+```
+
+---
+
+## Field semantics & guarantees
+
+- **Status drives layout.** `ValorantNotRunning` and `Menus` carry an empty `players` array.
+  `ValorantNotRunning` renders the waiting state. For `Menus` the shipped UI intentionally
+  **holds the last match**: if a match table was rendered earlier this app session, plain
+  `Menus` keeps that table on screen with a "Last match" chip in the header instead of the
+  empty state (the empty waiting screen shows only when no match has been seen yet). This is
+  a frontend-only display choice — the `Menus` snapshot itself still carries no players.
+  `Pregame` carries **only the local player's team** (max 5
+  rows) — Riot does not expose enemies during agent select; this is a platform limit, not a
+  bug. `Ingame` carries the full roster.
+- **Row order is guaranteed by the backend — the UI must NOT re-sort.** `players[]` is always
+  ordered: (1) the local player's team (`isAlly === true`) first, then the enemy team;
+  (2) within the ally block the local player (`isSelf === true`) is first; (3) the remaining
+  rows in each block are sorted by display name (case-insensitive), with hidden/unresolved
+  names (`name === null`, e.g. incognito) last, tie-broken by `id` (puuid) for stability.
+  In a multi-team mode (any row has a non-null `group`) the own group comes first (self
+  first), then the other groups in ascending `group` order.
+  Render rows in array order. **Colour by `isAlly` only** (ally block = blue, enemy = red);
+  do not read the raw `team` id for colour — it is Riot's internal Red/Blue label, exposed
+  only for debugging, and does not correspond to the ally/enemy split. `group` is for
+  the flat-list layout and the draft-agent portrait tint only, never for row colour. Snapshots captured before the
+  field existed lack it; treat that as `null`.
+- **`mode`** is one of: `Competitive`, `Unrated`, `Swiftplay`, `Spike Rush`, `Deathmatch`,
+  `Escalation`, `Replication`, `Team Deathmatch`, `Custom`, `Snowball Fight`,
+  `All Random One Site`, `Knockout`, `New Map`, `Gauntlet: Glitched`, or `Custom Game` (customs). Unknown queue ids
+  pass through as their raw string.
+- **`server`** is the in-game server picker's label for the match's game pod (Riot Support
+  "Server Select" wording). A pod city the backend has no label for arrives title-cased
+  (`"Virginia"`), never raw. In Pregame it is usually `null` (the agent-select payload may not
+  carry a pod id). Snapshots captured before the field existed lack it and `region`, so treat a
+  missing value like `null`. The header appends it to the mode line: `Competitive · US West
+  (N. California)`.
+- **`name` = null** when `incognito` is true (except for your own row) or the name-service did
+  not return a name. Always guard for null and render a placeholder.
+- **`accountLevel` = null** when the player is incognito, OR set "hide my level" — in either
+  case only when they are neither you nor a member of your party. You and your party members
+  always see the real level (the backend never nulls the self row). **Wire caveat:** Riot
+  itself zeroes `AccountLevel` in the coregame `PlayerIdentity` when the hide-level flag is set,
+  even for your own row, so an in-match self level may read `0` off the wire; your MENUS
+  presence carries the real level. The backend does not backfill from presence — it treats a
+  wire `0` as "hidden by Riot" and emits `null`, self row included. **`accountLevel` is
+  therefore never `0`:** the only values are a real level or `null`.
+- **`agent` = null / `agentSelectionState`** — `agentSelectionState` is Riot's raw
+  `CharacterSelectionState` string passed straight through (**not** a closed enum): type it as
+  `string | null`. `"locked"` and `"selected"` are the known values, but treat any other string
+  as possible. During Pregame a teammate who hasn't locked yet has `agent: null` and
+  `agentSelectionState: "selected"` (still picking) or `null`; once locked, `agent` is populated
+  and `agentSelectionState: "locked"`. It is `null` outside Pregame.
+- **`agent.playable`** is `false` only for a mode's stand-in agent. Gauntlet: Glitched gives
+  every player the draft agent `773f0c78-4486-752b-68ef-4585d7f4b848` (valorant-api name
+  "KAY/O", with its own `displayIcon`). Snapshots captured before the field existed lack it:
+  read missing as `true`.
+- **Ranks never error a row.** A private profile / new account / API hiccup yields
+  `tier: 0, name: "Unranked", iconUrl: null` and `rr: 0` for that player only.
+- **`peakRank`** already accounts for the pre-Ascendant tier renumbering — treat `tier` as a
+  modern tier number and map it with the same icons as `currentRank`.
+- **`peakRankAct`** is a display-ready short label for the act that peak was set in:
+  `"E{episode}: A{act}"` (`"E6: A3"`), or `"{episode}: A{act}"` when the episode identifier
+  already carries a letter — the V-era naming (`"V26: A1"`). Which episode/act an id maps to
+  is derived exactly as vRY does; only the formatting differs (vRY prints `(e6a3)`). It is
+  `null` when the peak is the player's current tier with no better season on record (nothing
+  to attribute it to) or the season id is missing from the content service. Render it
+  verbatim next to the peak icon.
+- **Party grouping** — players sharing a `partyId` are in the same party. `null` means solo
+  (or a party of one). Use it to draw the matching-dot / bracket accent from the UI spec.
+- **`iconUrl` / `splashUrl` etc.** are direct valorant-api.com PNG URLs. They are stable per
+  game patch. The backend caches the static-data *mappings*; the images themselves are plain
+  URLs the UI loads (and may cache) directly.
+- **`lastUpdated`** is epoch ms — use it for the "last updated" text in the header.
+
+### Per-player stat fields
+
+- **All these stats are populated for every player, incognito included** — a hidden player
+  still shows WR / ΔRR / last-5 / HS% / KD / skins; only `name` and `accountLevel` are withheld
+  (their puuid is known, so the stats are real). This matches vRY.
+- **`winRate`** is derived from the same MMR payload used for ranks (no extra request):
+  `{ percent, games }` where `percent = round(NumberOfWins / NumberOfGames * 100)`. `null`
+  when the player has 0 competitive games this season (render "N/A"). vRY renders this as
+  `"{percent} ({games})"`, e.g. `"57 (14)"`.
+- **`rrChange`** is the newest competitive match's `RankedRatingEarned` (can be negative,
+  zero, or positive). `null` when the player has no recent competitive matches.
+- **`recentResults`** is up to 5 recent competitive results, **newest first**. They first
+  arrive (clearing `pending.history`) derived from `RankedRatingEarned` sign: `> 0 → "Win"`,
+  `< 0 → "Loss"`, `= 0 → "Unknown"` (a 0-RR match is ambiguous: draw / placement /
+  AFK-adjusted; render it as a neutral pip, not a loss). Once a match's details have been read
+  for HS%/KD, a later snapshot replaces its pip with the real outcome: the player's team won →
+  `"Win"`, the other team won → `"Loss"`, no team won → `"Draw"`. A match whose details are
+  unavailable keeps its RR-derived pip, so `"Draw"` only ever comes from details and a pip can
+  change value while `pending.history` is already `false`. `[]` when the player has no recent
+  competitive matches.
+- **`headshotPercent`** is an integer 0–100 computed over the last few competitive matches
+  (`headshots / (headshots + bodyshots + legshots)`, matching vRY). `null` when the player
+  has no recent matches (render "N/a"). When some of those matches cannot be fetched (the
+  match that just ended is often not processed yet), both it and `kd` cover the ones that
+  could, and `null` only when none could.
+- **`kd`** is total kills / total deaths across the **same** recent competitive matches HS% is
+  computed from — it rides those already-downloaded match-details payloads and costs **zero
+  extra requests**. Rounded to 2 decimals (e.g. `1.28`); a window with 0 deaths yields the kill
+  count itself (7 kills, 0 deaths -> `7`). `null` when the player has no recent competitive
+  matches, or when the fetched matches carry no per-player stats entry for that player. Render
+  "N/A" for null. The two fields ride the same payload and are cached/withheld together, but
+  their null cases are **not identical**: `headshotPercent` is also `null` when the window
+  records zero shots, so a row can legitimately show `kd` with an "N/a" HS% — treat each
+  field's null independently.
+- **`statsMatches`** is how many matches `headshotPercent`/`kd` were computed from: `5` (the
+  full window, exported as `STATS_WINDOW` in `src/ipc/types.ts`) normally, fewer when some of
+  the window's matches were unavailable, `null` whenever both figures are `null`. It settles
+  with them under `pending.recentStats`. Snapshots captured before the field existed lack it,
+  so treat a missing value like `null`.
+- **`vandalSkin` / `phantomSkin`** are populated only in `Ingame` (Riot exposes loadouts only
+  once the match starts) — both are `null` in `Pregame` and `Menus`. A `SkinInfo` with an
+  empty `name` means the skin uuid was not in the static-data cache (render the icon if
+  present, otherwise a placeholder).
+
+## Notes for the UI
+
+- There is no manual refresh — the event fires on every change. Do not poll
+  `get_tracker_state` on a timer; use it only for the initial paint.
+- Copy-to-clipboard (UI spec: click a row → copy `name#tag`) should use `row.name` and no-op
+  when it is null.
+- The backend never throws for "game not running" — that arrives as a normal
+  `status: "ValorantNotRunning"` snapshot with a friendly `message`.
