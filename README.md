@@ -44,7 +44,7 @@ restarts.
 Grab the latest portable build from the
 [**Releases page**](https://github.com/yoruboku/Valtrace/releases):
 
-1. Download `Valtrace.exe`.
+1. Download `valtrace.exe`.
 2. Run it. There is **no installer**; the single `.exe` is the whole app.
 
 ### "Windows protected your PC" (SmartScreen)

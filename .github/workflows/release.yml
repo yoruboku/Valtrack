@@ -68,32 +68,18 @@ jobs:
 
       - name: Package portable executable & checksum
         run: |
-          $candidates = @(
-            "src-tauri/target/release/valtrace.exe",
-            "src-tauri\target\release\valtrace.exe",
-            "src-tauri/target/release/Valtrace.exe",
-            "src-tauri\target\release\Valtrace.exe"
-          )
-          $found = $null
-          foreach ($p in $candidates) {
-            if (Test-Path $p) {
-              $found = (Resolve-Path $p).Path
-              break
-            }
-          }
-          if (-not $found) {
-            $item = Get-ChildItem -Path "src-tauri" -Filter "*.exe" -Recurse | Where-Object { $_.Name -like "*valtrace*.exe" -and $_.Name -notlike "*.pdb" } | Select-Object -First 1
+          $exe = "src-tauri/target/release/valtrace.exe"
+          if (-not (Test-Path $exe)) {
+            $item = Get-ChildItem -Path "src-tauri" -Filter "valtrace.exe" -Recurse | Select-Object -First 1
             if ($item) {
-              $found = $item.FullName
+              $exe = $item.FullName
             } else {
-              Get-ChildItem -Path "src-tauri" -Recurse | Select-Object FullName
               throw "valtrace.exe not found in src-tauri"
             }
           }
-          Write-Output "Found binary at: $found"
-          Copy-Item $found "src-tauri/target/release/Valtrace.exe" -Force
-          $hash = (Get-FileHash "src-tauri/target/release/Valtrace.exe" -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Path "src-tauri/target/release/Valtrace.exe.sha256" -Value $hash -NoNewline -Encoding ascii
+          Write-Output "Found executable: $exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "src-tauri/target/release/valtrace.exe.sha256" -Value $hash -NoNewline -Encoding ascii
           Write-Output "Executable SHA256: $hash"
 
       - name: Publish GitHub Release
@@ -102,6 +88,6 @@ jobs:
           tag_name: ${{ steps.vars.outputs.tag }}
           name: "Valtrace ${{ steps.vars.outputs.tag }}"
           files: |
-            src-tauri/target/release/Valtrace.exe
-            src-tauri/target/release/Valtrace.exe.sha256
+            src-tauri/target/release/valtrace.exe
+            src-tauri/target/release/valtrace.exe.sha256
           generate_release_notes: true

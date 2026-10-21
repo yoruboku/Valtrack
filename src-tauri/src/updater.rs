@@ -18,8 +18,8 @@ const LATEST_RELEASE: &str =
 const USER_AGENT: &str = concat!("valtrace/", env!("CARGO_PKG_VERSION"));
 
 /// The release asset names are version-free on purpose (see docs/release.md).
-const EXE_ASSET: &str = "Valtrace.exe";
-const CHECKSUM_ASSET: &str = "Valtrace.exe.sha256";
+const EXE_ASSET: &str = "valtrace.exe";
+const CHECKSUM_ASSET: &str = "valtrace.exe.sha256";
 
 /// Extra extensions the swap uses: the download lands on `.exe.new`, the replaced binary
 /// keeps running as `.exe.old` until the next start deletes it.
