@@ -232,6 +232,7 @@ struct BuildCtx<'a> {
 struct SnapshotParts<'a> {
     players: &'a [MatchPlayer],
     parties: &'a HashMap<String, String>,
+    inferred_parties: &'a HashSet<String>,
     own_team: Option<String>,
     map: Option<MapInfo>,
     mode: Option<String>,
@@ -767,6 +768,78 @@ impl MatchDetailsCache {
                 self.map.remove(&oldest);
             }
         }
+    }
+
+    /// Infer party groupings for players without presence parties based on shared matches as teammates.
+    fn infer_parties(
+        &self,
+        puuids: &[String],
+        presence_parties: &HashMap<String, String>,
+    ) -> (HashMap<String, String>, HashSet<String>) {
+        let mut out_parties = presence_parties.clone();
+        let mut inferred_puuids = HashSet::new();
+
+        let candidates: Vec<&String> =
+            puuids.iter().filter(|p| !presence_parties.contains_key(*p)).collect();
+        if candidates.len() < 2 {
+            return (out_parties, inferred_puuids);
+        }
+
+        let mut pairs: HashMap<(&String, &String), usize> = HashMap::new();
+        for contribution in self.map.values() {
+            for (i, p1) in candidates.iter().enumerate() {
+                for p2 in &candidates[i + 1..] {
+                    if let (Some(m1), Some(m2)) = (contribution.get(*p1), contribution.get(*p2)) {
+                        if let (Some(t1), Some(t2)) = (&m1.team_id, &m2.team_id) {
+                            if !t1.is_empty() && t1 == t2 {
+                                let key = if p1 < p2 { (*p1, *p2) } else { (*p2, *p1) };
+                                *pairs.entry(key).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut adj: HashMap<&String, Vec<&String>> = HashMap::new();
+        for ((p1, p2), count) in pairs {
+            if count >= 1 {
+                adj.entry(p1).or_default().push(p2);
+                adj.entry(p2).or_default().push(p1);
+            }
+        }
+
+        let mut visited: HashSet<&String> = HashSet::new();
+        let mut group_idx = 1;
+        for p in candidates {
+            if visited.contains(p) || !adj.contains_key(p) {
+                continue;
+            }
+            let mut component = Vec::new();
+            let mut stack = vec![p];
+            visited.insert(p);
+            while let Some(curr) = stack.pop() {
+                component.push(curr);
+                if let Some(neighbors) = adj.get(curr) {
+                    for n in neighbors {
+                        if visited.insert(n) {
+                            stack.push(n);
+                        }
+                    }
+                }
+            }
+
+            if component.len() >= 2 {
+                let party_id = format!("inferred-party-{group_idx}");
+                for member in component {
+                    out_parties.insert((*member).clone(), party_id.clone());
+                    inferred_puuids.insert((*member).clone());
+                }
+                group_idx += 1;
+            }
+        }
+
+        (out_parties, inferred_puuids)
     }
 }
 
@@ -1457,9 +1530,13 @@ async fn build_match_snapshot(
     // match, and everything the match payload would carry is fixed for its duration, so this
     // path renders an own-presence event (the score rides the presence data) with one GET.
     if let Some(roster) = session.cache.cached_roster(&match_id, ingame) {
+        let puuids: Vec<String> = roster.players.iter().map(|p| p.puuid.clone()).collect();
+        let (parties, inferred_parties) =
+            session.match_details.infer_parties(&puuids, parties);
         let parts = SnapshotParts {
             players: &roster.players,
-            parties,
+            parties: &parties,
+            inferred_parties: &inferred_parties,
             own_team: roster.own_team.clone(),
             map: session.static_data.map(roster.map_id.as_deref()),
             mode,
@@ -1537,9 +1614,13 @@ async fn build_match_snapshot(
     // Fully cached (enriched, correct state) -> a single snapshot, no fetch. This is the
     // common in-match path: the score changes every round but nothing here is refetched.
     if session.cache.is_fresh_for(&match_id, ingame) {
+        let puuids: Vec<String> = players.iter().map(|p| p.puuid.clone()).collect();
+        let (parties, inferred_parties) =
+            session.match_details.infer_parties(&puuids, parties);
         let parts = SnapshotParts {
             players: &players,
-            parties,
+            parties: &parties,
+            inferred_parties: &inferred_parties,
             own_team,
             map,
             mode,
@@ -1573,10 +1654,12 @@ async fn build_match_snapshot(
     let _ = refresh_tokens(session).await;
 
     let puuids: Vec<String> = players.iter().map(|p| p.puuid.clone()).collect();
+    let (parties, inferred_parties) = session.match_details.infer_parties(&puuids, parties);
 
     let parts = SnapshotParts {
         players: &players,
-        parties,
+        parties: &parties,
+        inferred_parties: &inferred_parties,
         own_team,
         map,
         mode,
@@ -1680,6 +1763,7 @@ fn assemble_snapshot(
         names: &cache.names,
         mmr: &cache.mmr,
         parties: parts.parties,
+        inferred_parties: parts.inferred_parties,
         updates: &cache.updates,
         recent_stats: &cache.recent_stats,
         skins: &cache.skins,
@@ -2831,11 +2915,13 @@ mod tests {
     fn with_bare_ingame_parts(test: impl FnOnce(&SnapshotParts<'_>)) {
         let roster = roster_of("me");
         let parties = HashMap::new();
+        let inferred_parties = HashSet::new();
         let static_data = StaticData::default();
         let seasons: Vec<content::Season> = Vec::new();
         test(&SnapshotParts {
             players: &roster.players,
             parties: &parties,
+            inferred_parties: &inferred_parties,
             own_team: roster.own_team.clone(),
             map: None,
             mode: None,

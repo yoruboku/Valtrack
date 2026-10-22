@@ -16,13 +16,19 @@ import {
 import { Tooltip } from "./Tooltip";
 
 /** Same colour for everyone in a party. Solo players keep the column empty. */
-function PartyBar({ mark }: { mark: PartyMark | undefined }) {
+function PartyBar({ mark, inferred }: { mark: PartyMark | undefined; inferred?: boolean }) {
   if (!mark) return <span />;
+  const tooltip = inferred
+    ? `Estimated party of ${mark.size} (recent match teammates — players may not be queued together)`
+    : `Party of ${mark.size}`;
   return (
-    <Tooltip content={`Party of ${mark.size}`}>
+    <Tooltip content={tooltip}>
       <span
-        className="mx-auto block h-6 w-0.5 rounded-full"
-        style={{ backgroundColor: mark.color }}
+        className={`mx-auto block h-6 w-0.5 rounded-full ${inferred ? "opacity-75" : ""}`}
+        style={{
+          backgroundColor: mark.color,
+          outline: inferred ? "1px dashed rgba(255,255,255,0.4)" : "none",
+        }}
       />
     </Tooltip>
   );
@@ -53,7 +59,10 @@ export function PlayerRow({
         player.isSelf ? "bg-white/[0.04] ring-1 ring-white/10 ring-inset" : ""
       }`}
     >
-      <PartyBar mark={player.partyId ? layout.parties.get(player.partyId) : undefined} />
+      <PartyBar
+        mark={player.partyId ? layout.parties.get(player.partyId) : undefined}
+        inferred={player.partyInferred}
+      />
       <AgentCell
         agent={player.agent}
         group={player.group ?? null}

@@ -162,6 +162,9 @@ pub struct PlayerRow {
     pub account_level: Option<u32>,
     /// Party grouping id (only set when the player is in a party of >1).
     pub party_id: Option<String>,
+    /// True when the party was inferred from match history rather than presence.
+    #[serde(default)]
+    pub party_inferred: bool,
     /// Current-season win rate, or null when the player has 0 games this season.
     pub win_rate: Option<WinRate>,
     /// ΔRR of the player's newest competitive match, or null when no recent comp match.

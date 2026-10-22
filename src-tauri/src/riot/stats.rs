@@ -141,11 +141,13 @@ pub struct MatchTotals {
 }
 
 /// What one match-details payload contributes to one player.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayerMatch {
     pub totals: MatchTotals,
     /// The player's real outcome, or None when the payload carried no team results for them.
     pub result: Option<MatchResult>,
+    /// Team ID ("Blue" or "Red") the player was on in this match (used for co-queuer party inference).
+    pub team_id: Option<String>,
 }
 
 /// What one match-details payload contributes to each player who appears in it, keyed by
@@ -252,10 +254,15 @@ fn collect_kills_deaths(out: &mut MatchContribution, value: &Value) {
         let Some(subject) = player.get("subject").and_then(|s| s.as_str()) else {
             continue;
         };
+        let team_id = player.get("teamId").and_then(|t| t.as_str()).map(String::from);
+        let entry = out.entry(subject.to_string()).or_default();
+        if team_id.is_some() {
+            entry.team_id = team_id;
+        }
         let Some(player_stats) = player.get("stats") else {
             continue;
         };
-        let acc = &mut out.entry(subject.to_string()).or_default().totals;
+        let acc = &mut entry.totals;
         acc.kills += player_stats.get("kills").and_then(|v| v.as_u64()).unwrap_or(0);
         acc.deaths += player_stats.get("deaths").and_then(|v| v.as_u64()).unwrap_or(0);
         acc.kd_matches += 1;

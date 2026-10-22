@@ -97,6 +97,7 @@ export interface PlayerRow {
   peakRankAct: string | null;
   accountLevel: number | null;
   partyId: string | null;
+  partyInferred?: boolean;
 
   /** Per-group loading state. Read it through `pendingOf` — old snapshots predate it. */
   pending: PendingStats;

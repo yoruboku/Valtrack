@@ -9,7 +9,7 @@ use crate::riot::rank::{self, MmrResponse};
 use crate::riot::static_data::StaticData;
 use crate::riot::stats::{RecentStats, RrHistory};
 use crate::riot::types::{PendingStats, PlayerRow};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// All the resolved inputs needed to build the table.
 pub struct AssembleInput<'a> {
@@ -20,6 +20,8 @@ pub struct AssembleInput<'a> {
     pub mmr: &'a HashMap<String, MmrResponse>,
     /// puuid -> partyId (only real parties, size > 1).
     pub parties: &'a HashMap<String, String>,
+    /// puuids whose party was inferred from match history rather than presence.
+    pub inferred_parties: &'a HashSet<String>,
     /// puuid -> ΔRR + last-5 pips (phase 2; missing -> no history).
     pub updates: &'a HashMap<String, RrHistory>,
     /// puuid -> HS% + KD over recent matches (phase 2; missing / inner None -> null).
@@ -142,6 +144,7 @@ pub fn assemble_players(input: &AssembleInput) -> Vec<PlayerRow> {
                 peak_rank_act,
                 account_level,
                 party_id: player_party,
+                party_inferred: input.inferred_parties.contains(&p.puuid),
                 win_rate,
                 rr_change,
                 recent_results,
@@ -224,6 +227,7 @@ mod tests {
         names: HashMap<String, String>,
         mmr: HashMap<String, MmrResponse>,
         parties: HashMap<String, String>,
+        inferred_parties: HashSet<String>,
         updates: HashMap<String, RrHistory>,
         recent_stats: HashMap<String, RecentStats>,
         skins: HashMap<String, PlayerSkinIds>,
@@ -242,6 +246,7 @@ mod tests {
                 names: &self.names,
                 mmr: &self.mmr,
                 parties: &self.parties,
+                inferred_parties: &self.inferred_parties,
                 updates: &self.updates,
                 recent_stats: &self.recent_stats,
                 skins: &self.skins,
