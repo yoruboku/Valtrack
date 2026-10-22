@@ -1,6 +1,7 @@
 name: Release
 
-# Builds the portable Windows exe and creates a GitHub Release on every commit to main or on release tags.
+# Cross-compiles the portable Windows exe on Linux (ubuntu-latest) targeting x86_64-pc-windows-msvc
+# via cargo-xwin to save GitHub Actions runner minutes and costs.
 
 on:
   push:
@@ -22,11 +23,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: windows-latest
-
-    defaults:
-      run:
-        shell: pwsh
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -37,13 +34,21 @@ jobs:
       - name: Determine Version & Release Tag
         id: vars
         run: |
-          if ($env:GITHUB_REF -match '^refs/tags/(.+)') {
-            $tag = $Matches[1]
-          } else {
-            $tag = "v0.1.$env:GITHUB_RUN_NUMBER"
-          }
-          Write-Output "tag=$tag" >> $env:GITHUB_OUTPUT
-          Write-Output "Tag set to: $tag"
+          if [[ "$GITHUB_REF" =~ ^refs/tags/(.+) ]]; then
+            tag="${BASH_REMATCH[1]}"
+          else
+            tag="v0.1.$GITHUB_RUN_NUMBER"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Tag set to: $tag"
+
+      - name: Install LLVM / Clang and LLD
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm
+
+      - name: Install cargo-xwin
+        uses: taiki-e/install-action@cargo-xwin
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -58,11 +63,14 @@ jobs:
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: x86_64-pc-windows-msvc
 
       - name: Install frontend dependencies
         run: pnpm install --no-frozen-lockfile
@@ -70,24 +78,27 @@ jobs:
       - name: Build frontend
         run: pnpm build
 
-      - name: Build release binary
-        run: pnpm tauri build --no-bundle
+      - name: Build Windows release binary via cargo-xwin
+        run: pnpm tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --no-bundle
 
       - name: Package portable executable & checksum
         run: |
-          $exe = "src-tauri/target/release/valtrack.exe"
-          if (-not (Test-Path $exe)) {
-            $item = Get-ChildItem -Path "src-tauri" -Filter "valtrack.exe" -Recurse | Select-Object -First 1
-            if ($item) {
-              $exe = $item.FullName
-            } else {
-              throw "valtrack.exe not found in src-tauri"
-            }
-          }
-          Write-Output "Found executable: $exe"
-          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Path "$exe.sha256" -Value $hash -NoNewline -Encoding ascii
-          Write-Output "Executable SHA256: $hash"
+          target_file="src-tauri/target/x86_64-pc-windows-msvc/release/valtrack.exe"
+          if [ ! -f "$target_file" ]; then
+            target_file=$(find src-tauri/target -name "valtrack.exe" | head -n 1)
+          fi
+          if [ ! -f "$target_file" ]; then
+            echo "Error: valtrack.exe not found"
+            find src-tauri/target -type f -name "*.exe"
+            exit 1
+          fi
+          echo "Found executable: $target_file"
+          mkdir -p release-artifacts
+          cp "$target_file" release-artifacts/valtrack.exe
+          cd release-artifacts
+          sha256sum valtrack.exe | awk '{print $1}' > valtrack.exe.sha256
+          echo "SHA256: $(cat valtrack.exe.sha256)"
+          cd ..
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -95,6 +106,6 @@ jobs:
           tag_name: ${{ steps.vars.outputs.tag }}
           name: "Valtrack ${{ steps.vars.outputs.tag }}"
           files: |
-            src-tauri/target/release/valtrack.exe
-            src-tauri/target/release/valtrack.exe.sha256
+            release-artifacts/valtrack.exe
+            release-artifacts/valtrack.exe.sha256
           generate_release_notes: true
