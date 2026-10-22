@@ -68,26 +68,26 @@ jobs:
 
       - name: Package portable executable & checksum
         run: |
-          $exe = "src-tauri/target/release/valtrace.exe"
+          $exe = "src-tauri/target/release/valtrack.exe"
           if (-not (Test-Path $exe)) {
-            $item = Get-ChildItem -Path "src-tauri" -Filter "valtrace.exe" -Recurse | Select-Object -First 1
+            $item = Get-ChildItem -Path "src-tauri" -Filter "valtrack.exe" -Recurse | Select-Object -First 1
             if ($item) {
               $exe = $item.FullName
             } else {
-              throw "valtrace.exe not found in src-tauri"
+              throw "valtrack.exe not found in src-tauri"
             }
           }
           Write-Output "Found executable: $exe"
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Path "src-tauri/target/release/valtrace.exe.sha256" -Value $hash -NoNewline -Encoding ascii
+          Set-Content -Path "$exe.sha256" -Value $hash -NoNewline -Encoding ascii
           Write-Output "Executable SHA256: $hash"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
-          name: "Valtrace ${{ steps.vars.outputs.tag }}"
+          name: "Valtrack ${{ steps.vars.outputs.tag }}"
           files: |
-            src-tauri/target/release/valtrace.exe
-            src-tauri/target/release/valtrace.exe.sha256
+            src-tauri/target/release/valtrack.exe
+            src-tauri/target/release/valtrack.exe.sha256
           generate_release_notes: true

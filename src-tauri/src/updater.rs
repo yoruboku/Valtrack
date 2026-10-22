@@ -15,11 +15,11 @@ const LATEST_RELEASE: &str =
     "https://api.github.com/repos/yoruboku/Valtrace/releases/latest";
 
 /// GitHub rejects API requests without a User-Agent.
-const USER_AGENT: &str = concat!("valtrace/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("valtrack/", env!("CARGO_PKG_VERSION"));
 
 /// The release asset names are version-free on purpose (see docs/release.md).
-const EXE_ASSET: &str = "valtrace.exe";
-const CHECKSUM_ASSET: &str = "valtrace.exe.sha256";
+const EXE_ASSET: &str = "valtrack.exe";
+const CHECKSUM_ASSET: &str = "valtrack.exe.sha256";
 
 /// Extra extensions the swap uses: the download lands on `.exe.new`, the replaced binary
 /// keeps running as `.exe.old` until the next start deletes it.
