@@ -4,8 +4,6 @@ A lightweight Windows desktop app that shows an **in-match player table** for
 your current VALORANT match: everyone's rank, RR, peak rank, level, agent, and
 per-player stats in a clean GUI.
 
-![Valorant Lightweight Tracker showing an in-match player table](docs/assets/app-screenshot.png)
-
 ## Why this tracker
 
 Sites and overlay apps make you tab out, log in, or feed a heavy client just to
@@ -106,16 +104,12 @@ pnpm tauri dev                  # run the app in development (hot reload)
 pnpm tauri build --no-bundle    # build the portable exe
 ```
 
-The exe lands in `src-tauri/target/release/`. This is the same build the
-release workflow runs; see [`docs/release.md`](docs/release.md) for how tagged
-releases are built.
+The exe lands in `src-tauri/target/release/`.
 
 ## Development
 
 The UI can run against JSON snapshot data instead of a live game, including in
-a plain browser with no Rust or Valorant at all. Debug builds can also capture
-real snapshots to JSON while you play. See [`docs/testing.md`](docs/testing.md)
-for both workflows.
+a plain browser with no Rust or Valorant at all (`pnpm dev`).
 
 ## Disclaimer
 
