@@ -150,6 +150,16 @@ impl RemoteClient {
         .await
     }
 
+    /// match-history across all queues (used as fallback for casual/Premier players when competitive updates are empty).
+    pub async fn match_history(&self, puuid: &str) -> Result<Value> {
+        let end = crate::riot::constants::COMPETITIVE_UPDATES_END_INDEX;
+        self.get(&format!(
+            "{}/match-history/v1/history/{}?startIndex=0&endIndex={}",
+            self.hosts.pd, puuid, end
+        ))
+        .await
+    }
+
     /// match-details for one match (~500 KB) — the HS% source (phase 2).
     pub async fn match_details(&self, match_id: &str) -> Result<Value> {
         self.get(&format!("{}/match-details/v1/matches/{}", self.hosts.pd, match_id)).await

@@ -88,6 +88,30 @@ pub fn parse_competitive_updates(value: Value) -> RrHistory {
     RrHistory { rr_change, results, result_match_ids, recent_match_ids }
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct MatchHistoryWire {
+    #[serde(rename = "History", default)]
+    history: Vec<MatchHistoryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MatchHistoryEntry {
+    #[serde(rename = "MatchID", default)]
+    match_id: String,
+}
+
+/// Extract recent match ids from general `/match-history` for casual/Premier players
+/// when competitive updates return empty.
+pub fn parse_match_history_ids(value: Value) -> Vec<String> {
+    let wire: MatchHistoryWire = serde_json::from_value(value).unwrap_or_default();
+    wire.history
+        .into_iter()
+        .take(RECENT_MATCHES_FOR_HS)
+        .filter(|m| !m.match_id.is_empty())
+        .map(|m| m.match_id)
+        .collect()
+}
+
 // --- match-details accounting (HS% + KD) ------------------------------------
 
 /// The per-player figures derived from the recent match-details payloads. Both come from
@@ -534,5 +558,22 @@ mod tests {
         });
         // m3 has no details, so its RR-inferred pip stands.
         assert_eq!(h.results, vec![MatchResult::Draw, MatchResult::Loss, MatchResult::Loss]);
+    }
+
+    #[test]
+    fn parses_general_match_history_ids() {
+        let payload = json!({
+            "History": [
+                { "MatchID": "match-1", "QueueID": "unrated" },
+                { "MatchID": "match-2", "QueueID": "swiftplay" },
+                { "MatchID": "", "QueueID": "invalid" },
+                { "MatchID": "match-3", "QueueID": "premier" }
+            ]
+        });
+        assert_eq!(
+            parse_match_history_ids(payload),
+            vec!["match-1".to_string(), "match-2".to_string(), "match-3".to_string()]
+        );
+        assert!(parse_match_history_ids(json!({})).is_empty());
     }
 }

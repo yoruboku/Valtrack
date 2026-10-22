@@ -1988,7 +1988,15 @@ async fn fetch_phase2(
         };
         match result {
             Ok(v) => {
-                cache.updates.insert(puuid.clone(), stats::parse_competitive_updates(v));
+                let mut history = stats::parse_competitive_updates(v);
+                if history.recent_match_ids.is_empty() {
+                    // Casual/Premier player with no competitive history in current window:
+                    // query general match history so HS% and KD can still be computed.
+                    if let Ok(hist_val) = with_rate_limit_retry(gate, || remote.match_history(puuid)).await {
+                        history.recent_match_ids = stats::parse_match_history_ids(hist_val);
+                    }
+                }
+                cache.updates.insert(puuid.clone(), history);
                 progress.publish_progress(cache, false);
             }
             Err(Error::BadClaims) => return Err(Error::BadClaims),
