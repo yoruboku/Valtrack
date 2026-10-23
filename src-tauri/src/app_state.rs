@@ -1382,25 +1382,32 @@ async fn build_snapshot(session: &mut Session, ctx: &mut BuildCtx<'_>) -> Result
         }
     }
 
-    // Self-correct hosts from the presence pid domain if initial connect fell back to NA
-    // (e.g. client was still starting up and external-sessions wasn't ready).
+    // Self-correct hosts if initial connect fell back to NA (e.g. tracker was opened before Valorant launched).
+    // Now that presence has arrived or match is in progress, re-query deployment_region from external-sessions,
+    // or scan presences for a cluster domain hint.
     if session.remote.hosts.region == "na" {
-        if let Some(pid) = own.and_then(|p| p.pid.as_deref()) {
-            if let Some(hint) = crate::riot::constants::region_from_pid(pid) {
-                if hint != session.remote.hosts.region {
-                    let new_hosts = crate::riot::remote_api::build_hosts(hint);
-                    vlt_log!(
-                        "conn",
-                        "correcting hosts region {} -> {} (from presence pid {}, shard {} -> {})",
-                        session.remote.hosts.region,
-                        new_hosts.region,
-                        pid,
-                        session.remote.hosts.shard,
-                        new_hosts.shard
-                    );
-                    session.remote.hosts = new_hosts;
-                    ctx.state.with_diagnostics(|d| d.note_corrected_region(hint));
-                }
+        let corrected_region = if let Some(dep) = session.local.deployment_region().await {
+            Some(dep)
+        } else {
+            presences.iter().find_map(|p| {
+                p.pid.as_deref().and_then(crate::riot::constants::region_from_pid).map(String::from)
+            })
+        };
+
+        if let Some(hint) = corrected_region {
+            let normalized = crate::riot::constants::normalize_region(&hint);
+            if normalized != session.remote.hosts.region {
+                let new_hosts = crate::riot::remote_api::build_hosts(&hint);
+                vlt_log!(
+                    "conn",
+                    "correcting hosts region {} -> {} (shard {} -> {})",
+                    session.remote.hosts.region,
+                    new_hosts.region,
+                    session.remote.hosts.shard,
+                    new_hosts.shard
+                );
+                session.remote.hosts = new_hosts;
+                ctx.state.with_diagnostics(|d| d.note_corrected_region(&hint));
             }
         }
     }

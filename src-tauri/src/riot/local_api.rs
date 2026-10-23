@@ -176,8 +176,18 @@ pub fn extract_region_from_sessions(value: &Value) -> Option<String> {
         }
     }
 
-    // Fallback scan across text
-    extract_ares_deployment(&value.to_string())
+    // Fallback scan across text: ares-deployment, glz host, or pd shard
+    let text = value.to_string();
+    if let Some(shard) = extract_ares_deployment(&text) {
+        return Some(shard);
+    }
+    if let Some(region) = extract_glz_region(&text) {
+        return Some(region);
+    }
+    if let Some(shard) = extract_pd_shard(&text) {
+        return Some(shard);
+    }
+    None
 }
 
 fn extract_ares_deployment(text: &str) -> Option<String> {
@@ -191,6 +201,32 @@ fn extract_ares_deployment(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_glz_region(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let glz = lower.find("glz-")?;
+    let after = &lower[glz + 4..];
+    let end = after.find("-1.")?;
+    let region = &after[..end];
+    if !region.is_empty() && region.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        Some(region.to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_pd_shard(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let pd = lower.find("pd.")?;
+    let after = &lower[pd + 3..];
+    let end = after.find(".a.pvp.net")?;
+    let shard = &after[..end];
+    if !shard.is_empty() && shard.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(shard.to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
