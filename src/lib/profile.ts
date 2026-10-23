@@ -3,7 +3,7 @@ import { APP_VERSION } from "./updater";
 
 /** tracker.gg is a link-out only — no scraping, no API. See `docs/ui-spec.md`. */
 const PROFILE_BASE = "https://tracker.gg/valorant/profile/riot";
-const REPO = "https://github.com/yoruboku/Valtrace";
+const REPO = "https://github.com/yoruboku/Valtrack";
 
 const profileUrl = (riotId: string): string =>
   `${PROFILE_BASE}/${encodeURIComponent(riotId)}/overview`;

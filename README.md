@@ -40,7 +40,7 @@ restarts.
 ## Download
 
 Grab the latest portable build from the
-[**Releases page**](https://github.com/yoruboku/Valtrace/releases):
+[**Releases page**](https://github.com/yoruboku/Valtrack/releases):
 
 1. Download `valtrack.exe`.
 2. Run it. There is **no installer**; the single `.exe` is the whole app.
@@ -87,7 +87,7 @@ reporting.
 ## Reporting a bug
 
 Click **Report a bug** at the bottom of the waiting screen, or open the [issues
-page](https://github.com/yoruboku/Valtrace/issues)
+page](https://github.com/yoruboku/Valtrack/issues)
 directly. Say which of the screens above you were stuck on, then press **Copy
 diagnostics** on the waiting screen and paste the report into the issue. That
 report is what turns "it doesn't detect my match" into something fixable.

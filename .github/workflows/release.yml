@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -109,7 +109,7 @@ jobs:
           mkdir -p release-artifacts
           cp "$target_file" release-artifacts/valtrack.exe
           cd release-artifacts
-          sha256sum valtrack.exe | awk '{print $1}' > valtrack.exe.sha256
+          printf "%s" $(sha256sum valtrack.exe | awk '{print $1}') > valtrack.exe.sha256
           echo "SHA256: $(cat valtrack.exe.sha256)"
           cd ..
 

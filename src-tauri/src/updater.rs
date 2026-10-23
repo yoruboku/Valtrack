@@ -12,7 +12,7 @@ use std::time::Duration;
 /// The one release record both commands read. Unauthenticated (60 requests/h/IP), which
 /// requires the repo and its releases to be public.
 const LATEST_RELEASE: &str =
-    "https://api.github.com/repos/yoruboku/Valtrace/releases/latest";
+    "https://api.github.com/repos/yoruboku/Valtrack/releases/latest";
 
 /// GitHub rejects API requests without a User-Agent.
 const USER_AGENT: &str = concat!("valtrack/", env!("CARGO_PKG_VERSION"));
@@ -98,13 +98,11 @@ fn parse_release(body: &serde_json::Value) -> Option<Release> {
     })
 }
 
-/// Read the `.sha256` asset: exactly the 64 lowercase hex characters the release workflow
-/// writes, with nothing around them. Anything else is not a digest this updater trusts.
+/// Read the `.sha256` asset: 64 lowercase hex characters, tolerating whitespace/newline.
 fn parse_checksum(body: &[u8]) -> Option<&str> {
-    let usable = body.len() == 64 && body.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    usable
-        .then_some(body)
-        .and_then(|hex| std::str::from_utf8(hex).ok())
+    let s = std::str::from_utf8(body).ok()?.trim();
+    let usable = s.len() == 64 && s.as_bytes().iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    usable.then_some(s)
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -131,6 +129,7 @@ fn http() -> Result<reqwest::Client, String> {
         .connect_timeout(Duration::from_secs(10))
         // Bounds a stalled transfer without capping the download's total duration.
         .read_timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(5))
         .user_agent(USER_AGENT)
         .build()
         .map_err(|e| format!("could not start an HTTPS client: {e}"))
@@ -439,10 +438,9 @@ mod tests {
     fn reads_the_checksum_file() {
         let digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
         assert_eq!(parse_checksum(digest.as_bytes()), Some(digest));
-        // Exactly the digest the release workflow writes — nothing around it, no upper case,
-        // no sha256sum file name, and no trailing newline.
-        assert_eq!(parse_checksum(format!("{digest}\n").as_bytes()), None);
-        assert_eq!(parse_checksum(format!(" {digest}").as_bytes()), None);
+        // Tolerates trailing newline / whitespace
+        assert_eq!(parse_checksum(format!("{digest}\n").as_bytes()), Some(digest));
+        assert_eq!(parse_checksum(format!(" {digest} \r\n").as_bytes()), Some(digest));
         assert_eq!(parse_checksum(format!("{digest} *app.exe").as_bytes()), None);
         assert_eq!(parse_checksum(digest.to_ascii_uppercase().as_bytes()), None);
         assert_eq!(parse_checksum(b""), None);

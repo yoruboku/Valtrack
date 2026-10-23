@@ -1,4 +1,4 @@
-Required Notice: Copyright (c) 2026 yoruboku (https://github.com/yoruboku/Valtrace)
+Required Notice: Copyright (c) 2026 yoruboku (https://github.com/yoruboku/Valtrack)
 
 # PolyForm Noncommercial License 1.0.0
 
