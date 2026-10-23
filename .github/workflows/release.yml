@@ -36,11 +36,15 @@ jobs:
         run: |
           if [[ "$GITHUB_REF" =~ ^refs/tags/(.+) ]]; then
             tag="${BASH_REMATCH[1]}"
+            version="${tag#v}"
           else
-            tag="v0.1.$GITHUB_RUN_NUMBER"
+            version="0.1.$GITHUB_RUN_NUMBER"
+            tag="v$version"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "Tag set to: $tag"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Bumping app version to: $version"
+          node scripts/bump-version.mjs "$version"
 
       - name: Install LLVM / Clang and LLD
         run: |
