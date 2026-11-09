@@ -162,7 +162,7 @@ export function Header({
 
         <div className="min-w-0">
           <h1 className="truncate text-[13px] font-semibold tracking-[0.14em] text-neutral-100 uppercase">
-            {map?.name || "Valorant Tracker"}
+            {map?.name || "Valtrack"}
           </h1>
           {subtitle && <p className="truncate text-[11px] text-neutral-500">{subtitle}</p>}
         </div>

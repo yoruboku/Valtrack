@@ -1,19 +1,11 @@
 name: Release
 
-# Cross-compiles the portable Windows exe on Linux (ubuntu-latest) targeting x86_64-pc-windows-msvc
+# Cross-compiles the portable Windows exe on Linux (ubuntu-24.04) targeting x86_64-pc-windows-msvc
 # via cargo-xwin to save GitHub Actions runner minutes and costs.
+# Releases are triggered exclusively by version tags (vX.Y.Z) or manual workflow_dispatch.
 
 on:
   push:
-    branches:
-      - main
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.vscode/**'
-      - '.gitignore'
-      - 'LICENSE*'
-      - '.github/ISSUE_TEMPLATE/**'
     tags:
       - "v*"
   workflow_dispatch:
@@ -31,20 +23,70 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Determine Version & Release Tag
+      - name: Validate tag format & verify manifests
         id: vars
         run: |
           if [[ "$GITHUB_REF" =~ ^refs/tags/(.+) ]]; then
             tag="${BASH_REMATCH[1]}"
-            version="${tag#v}"
           else
-            version="0.1.$GITHUB_RUN_NUMBER"
-            tag="v$version"
+            tag="v$(node -p 'require("./package.json").version')"
           fi
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Tag '$tag' is not a valid release tag. Release tags must be vX.Y.Z (e.g. v0.2.0)."
+            exit 1
+          fi
+          version="${tag#v}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Bumping app version to: $version"
-          node scripts/bump-version.mjs "$version"
+          echo "Building release for tag $tag (version $version)"
+
+          node -e '
+            const fs = require("fs");
+            const expected = "'"$version"'";
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
+            const tauri = JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8")).version;
+            const cargo = fs.readFileSync("src-tauri/Cargo.toml", "utf8").match(/\[package\][^\[]*?\bversion\s*=\s*"([^"]+)"/)?.[1];
+            const mismatches = [];
+            if (pkg !== expected) mismatches.push(`package.json: ${pkg}`);
+            if (tauri !== expected) mismatches.push(`tauri.conf.json: ${tauri}`);
+            if (cargo !== expected) mismatches.push(`Cargo.toml: ${cargo}`);
+            if (mismatches.length > 0) {
+              console.error(`Version mismatch for tag v${expected}:\n  ` + mismatches.join("\n  "));
+              process.exit(1);
+            }
+          '
+
+      - name: Extract curated release notes from CHANGELOG.md
+        run: |
+          node -e '
+            const fs = require("fs");
+            const version = "'"${{ steps.vars.outputs.version }}"'";
+            const changelog = fs.readFileSync("CHANGELOG.md", "utf8");
+            const lines = changelog.split("\n");
+            let start = -1;
+            for (let i = 0; i < lines.length; i++) {
+              if (lines[i].match(new RegExp(`^##\\s+v${version.replace(/\\./g, "\\\\.")}(?!\\d)`))) {
+                start = i;
+                break;
+              }
+            }
+            if (start < 0) {
+              console.error(`CHANGELOG.md has no ## v${version} section.`);
+              process.exit(1);
+            }
+            const body = [];
+            for (let i = start + 1; i < lines.length; i++) {
+              if (lines[i].match(/^##\s/)) break;
+              body.push(lines[i]);
+            }
+            const notes = body.join("\n").trim();
+            if (!notes) {
+              console.error(`The ## v${version} section in CHANGELOG.md is empty.`);
+              process.exit(1);
+            }
+            fs.mkdirSync("release-artifacts", { recursive: true });
+            fs.writeFileSync("release-artifacts/release-notes.md", notes);
+          '
 
       - name: Install LLVM / Clang and LLD
         run: |
@@ -88,10 +130,13 @@ jobs:
           XWIN_CROSS_COMPILER: clang
 
       - name: Install frontend dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
-      - name: Build frontend
+      - name: Run frontend typecheck and build
         run: pnpm build
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build Windows release binary via cargo-xwin
         run: pnpm tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --no-bundle
@@ -122,7 +167,8 @@ jobs:
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
           name: "Valtrack ${{ steps.vars.outputs.tag }}"
+          body_path: release-artifacts/release-notes.md
           files: |
             release-artifacts/valtrack.exe
             release-artifacts/valtrack.exe.sha256
-          generate_release_notes: true
+          fail_on_unmatched_files: true

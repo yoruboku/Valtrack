@@ -3,6 +3,18 @@
 What changed in each release, in plain English. Newest release first. Every
 version tag needs an entry here before it can be released.
 
+## v0.2.0 - 2026-11-09
+
+- Added automatic live game region and shard detection via local external sessions
+  (`-ares-deployment`), fixing issues where non-NA players were stuck on "Waiting for a match".
+- Added opponent and non-friend party detection by analyzing shared teammate history from
+  recent matches, including a visual indicator and clarification tooltip for estimated parties.
+- Added match history fallback: players in casual modes (Unrated, Swiftplay) or Premier who
+  do not actively play competitive now have their recent headshot % and KD calculated.
+- Switched the release pipeline to high-efficiency Linux cross-compilation with `cargo-xwin`
+  and Clang, significantly reducing build times and CI costs.
+- Completely updated the app identity to Valtrack across diagnostics, window headers, and local caches.
+
 ## v0.1.5 - 2026-10-12
 
 - Added support for Gauntlet: Glitched. The header now shows the mode name, and all

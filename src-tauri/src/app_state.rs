@@ -2622,6 +2622,7 @@ mod tests {
         let played = |kills, deaths| stats::PlayerMatch {
             totals: MatchTotals { kills, deaths, kd_matches: 1, ..Default::default() },
             result: None,
+            team_id: None,
         };
         let mut contribution = MatchContribution::new();
         contribution.insert("a".into(), played(20, 15));
@@ -2644,7 +2645,7 @@ mod tests {
             { "MatchID": "m3", "RankedRatingEarned": -18 }
         ]}));
         let mut cache = MatchDetailsCache::default();
-        let player = |result| stats::PlayerMatch { totals: MatchTotals::default(), result };
+        let player = |result| stats::PlayerMatch { totals: MatchTotals::default(), result, team_id: None };
 
         // Nothing downloaded yet: the pips stay as competitiveupdates painted them.
         cache.upgrade_pips(&mut history, "a");
@@ -2705,7 +2706,7 @@ mod tests {
         let mut cache = MatchDetailsCache::default();
         let mut contribution = MatchContribution::new();
         let played = MatchTotals { kills: 20, deaths: 15, kd_matches: 1, ..Default::default() };
-        contribution.insert("a".into(), stats::PlayerMatch { totals: played, result: None });
+        contribution.insert("a".into(), stats::PlayerMatch { totals: played, result: None, team_id: None });
         cache.put("m1", contribution);
         let mut failed = HashSet::new();
         failed.insert("m2".to_string());
@@ -2740,7 +2741,7 @@ mod tests {
         let ids = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut cache = MatchDetailsCache::default();
         for (id, totals) in [("m2", played(2, 8, 20, 10)), ("m3", played(3, 7, 10, 10))] {
-            let player = stats::PlayerMatch { totals, result: None };
+            let player = stats::PlayerMatch { totals, result: None, team_id: None };
             cache.put(id, MatchContribution::from([("a".to_string(), player)]));
         }
         let mut unprocessed = HashSet::new();

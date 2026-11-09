@@ -316,7 +316,7 @@ pub fn build(
 fn cache_dir() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")?;
     let mut p = std::path::PathBuf::from(base);
-    p.push("valorant-lightweight-tracker");
+    p.push("valtrack");
     p.push("static-cache");
     Some(p)
 }

@@ -254,14 +254,13 @@ fn collect_kills_deaths(out: &mut MatchContribution, value: &Value) {
         let Some(subject) = player.get("subject").and_then(|s| s.as_str()) else {
             continue;
         };
-        let team_id = player.get("teamId").and_then(|t| t.as_str()).map(String::from);
-        let entry = out.entry(subject.to_string()).or_default();
-        if team_id.is_some() {
-            entry.team_id = team_id;
-        }
         let Some(player_stats) = player.get("stats") else {
             continue;
         };
+        let entry = out.entry(subject.to_string()).or_default();
+        if let Some(team_id) = player.get("teamId").and_then(|t| t.as_str()) {
+            entry.team_id = Some(team_id.to_string());
+        }
         let acc = &mut entry.totals;
         acc.kills += player_stats.get("kills").and_then(|v| v.as_u64()).unwrap_or(0);
         acc.deaths += player_stats.get("deaths").and_then(|v| v.as_u64()).unwrap_or(0);

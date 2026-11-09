@@ -406,10 +406,10 @@ mod tests {
         let body = json!({
             "tag_name": "v0.2.0",
             "assets": [
-                { "name": "valorant-lightweight-tracker.exe.sha256",
+                { "name": "valtrack.exe.sha256",
                   "browser_download_url": "https://x/sum" },
                 { "name": "something-else.txt", "browser_download_url": "https://x/other" },
-                { "name": "valorant-lightweight-tracker.exe",
+                { "name": "valtrack.exe",
                   "browser_download_url": "https://x/exe" }
             ]
         });
@@ -424,7 +424,7 @@ mod tests {
         let exe_only = json!({
             "tag_name": "v0.2.0",
             "assets": [
-                { "name": "valorant-lightweight-tracker.exe",
+                { "name": "valtrack.exe",
                   "browser_download_url": "https://x/exe" }
             ]
         });

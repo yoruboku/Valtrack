@@ -284,6 +284,7 @@ mod tests {
             product: Some("valorant".into()),
             private: Some(String::new()),
             champion_id: None,
+            pid: None,
         };
         assert!(matches!(info_for(&raw), Err(Error::NotReady)));
     }
@@ -296,6 +297,7 @@ mod tests {
             product: Some("valorant".into()),
             private: Some(encode(&decoded)),
             champion_id: None,
+            pid: None,
         })
         .unwrap();
         assert_eq!(info.session_state, Some(SessionLoopState::Ingame));
@@ -308,6 +310,7 @@ mod tests {
             product: Some("league_of_legends".into()),
             private: Some("x".into()),
             champion_id: Some(json!(157)),
+            pid: None,
         };
         assert!(!lol.is_valorant());
     }
@@ -318,9 +321,9 @@ mod tests {
         let duo_a = json!({ "sessionLoopState": "MENUS", "partyId": "duo", "partySize": 2 });
         let duo_b = json!({ "sessionLoopState": "MENUS", "partyId": "duo", "partySize": 2 });
         let presences = vec![
-            RawPresence { puuid: "s".into(), product: Some("valorant".into()), private: Some(encode(&solo)), champion_id: None },
-            RawPresence { puuid: "a".into(), product: Some("valorant".into()), private: Some(encode(&duo_a)), champion_id: None },
-            RawPresence { puuid: "b".into(), product: Some("valorant".into()), private: Some(encode(&duo_b)), champion_id: None },
+            RawPresence { puuid: "s".into(), product: Some("valorant".into()), private: Some(encode(&solo)), champion_id: None, pid: None },
+            RawPresence { puuid: "a".into(), product: Some("valorant".into()), private: Some(encode(&duo_a)), champion_id: None, pid: None },
+            RawPresence { puuid: "b".into(), product: Some("valorant".into()), private: Some(encode(&duo_b)), champion_id: None, pid: None },
         ];
         let grouping = party_grouping(&presences);
         assert!(!grouping.contains_key("s"));

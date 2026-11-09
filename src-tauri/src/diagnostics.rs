@@ -412,7 +412,7 @@ fn render(
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
 
-    lines.push("Valorant Lightweight Tracker diagnostics".to_string());
+    lines.push("Valtrack diagnostics".to_string());
     lines.push(format!(
         "app: v{} ({}) | {} | {}",
         env.app_version, env.profile, env.os, env.webview
@@ -708,7 +708,7 @@ mod tests {
             EXAMPLE_WALL_MS,
         );
         let expected = "\
-Valorant Lightweight Tracker diagnostics
+Valtrack diagnostics
 app: v0.1.2 (release) | Windows 10.0 build 26100 | webview2 140.0.3485.54
 time: 2026-09-03 14:22:05Z | uptime: 12m34s | screen: \"Waiting for a match\" | held last-match table available: no
 status: Menus (since 11m50s ago) | message: - | builds: 3

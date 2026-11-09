@@ -26,7 +26,7 @@ const COPIED_MS = 2000;
  * puts something pasteable on the clipboard.
  */
 const unavailable = (cause: unknown): string =>
-  `Valorant Lightweight Tracker diagnostics\napp: v${APP_VERSION}\ndiagnostics unavailable: ${String(cause)}`;
+  `Valtrack diagnostics\napp: v${APP_VERSION}\ndiagnostics unavailable: ${String(cause)}`;
 
 export interface CopyDiagnostics {
   phase: CopyPhase;
