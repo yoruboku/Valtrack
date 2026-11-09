@@ -4,7 +4,10 @@
 
 use crate::diagnostics::{Diagnostics, PresenceDiag, SessionDiag};
 use crate::riot::assemble::{assemble_players, AssembleInput};
-use crate::riot::constants::{game_mode_name, game_server_name, INTER_REQUEST_DELAY_MS};
+use crate::riot::constants::{
+    game_mode_name, game_server_name, COMPETITIVE_CONCURRENCY, INTER_REQUEST_DELAY_MS,
+    MATCH_DETAILS_CONCURRENCY, MMR_CONCURRENCY,
+};
 use crate::riot::content;
 use crate::riot::error::{Error, Result};
 use crate::riot::loadout::{self, PlayerSkinIds};
@@ -1663,6 +1666,15 @@ async fn build_match_snapshot(
     let puuids: Vec<String> = players.iter().map(|p| p.puuid.clone()).collect();
     let (parties, inferred_parties) = session.match_details.infer_parties(&puuids, parties);
 
+    // Prioritize allies over enemies in fetch order so teammates' ranks and stats land first.
+    let mut puuids: Vec<String> = players.iter().map(|p| p.puuid.clone()).collect();
+    if let Some(team) = &own_team {
+        puuids.sort_by_key(|p| {
+            let is_ally = players.iter().find(|pl| pl.puuid == *p).map(|pl| pl.team == *team).unwrap_or(false);
+            !is_ally
+        });
+    }
+
     let parts = SnapshotParts {
         players: &players,
         parties: &parties,
@@ -1836,6 +1848,7 @@ fn rate_limit_backoff(retry_after_secs: Option<u64>) -> Duration {
 #[derive(Default)]
 struct RateLimitGate {
     until: Mutex<Option<Instant>>,
+    history: Mutex<VecDeque<Instant>>,
 }
 
 impl RateLimitGate {
@@ -1860,6 +1873,45 @@ impl RateLimitGate {
         match *until {
             Some(held) if held >= deadline => {}
             _ => *until = Some(deadline),
+        }
+    }
+
+    /// Record a batch of outgoing requests and prune timestamps older than 120 seconds.
+    fn record_requests(&self, count: usize) {
+        let mut hist = self.history.lock().unwrap();
+        let now = Instant::now();
+        for _ in 0..count {
+            hist.push_back(now);
+        }
+        let cutoff = now.checked_sub(Duration::from_secs(120)).unwrap_or(now);
+        while let Some(front) = hist.front() {
+            if *front < cutoff {
+                hist.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Dynamic pacing: if request volume in the rolling 120s window is high, gently brake
+    /// before Riot's ~100 request threshold triggers a 429 penalty.
+    fn adaptive_delay(&self) -> Duration {
+        let mut hist = self.history.lock().unwrap();
+        let now = Instant::now();
+        let cutoff = now.checked_sub(Duration::from_secs(120)).unwrap_or(now);
+        while let Some(front) = hist.front() {
+            if *front < cutoff {
+                hist.pop_front();
+            } else {
+                break;
+            }
+        }
+        if hist.len() > 75 {
+            Duration::from_millis(160)
+        } else if hist.len() > 55 {
+            Duration::from_millis(110)
+        } else {
+            Duration::from_millis(INTER_REQUEST_DELAY_MS)
         }
     }
 }
@@ -1934,16 +1986,10 @@ async fn fetch_names(
 }
 
 /// A short pause between the per-player stat requests at match start (spec: bounded,
-/// sequential-ish burst) — works alongside the existing 429 retry.
-fn inter_request_delay() -> Duration {
-    Duration::from_millis(INTER_REQUEST_DELAY_MS)
+/// sequential-ish burst) — works alongside the existing 429 retry and adapts to rolling load.
+fn inter_request_delay(gate: &RateLimitGate) -> Duration {
+    gate.adaptive_delay()
 }
-
-/// How many match-details downloads a player's HS%/KD window sends at once. They are the
-/// burst's bulk (~45 requests for a full comp lobby) and its slowest calls, so two lanes
-/// roughly halve the wall clock. The 429 gate is what keeps the higher rate safe: both lanes
-/// consult it before sending and arm it on a limit, so an armed backoff holds them both.
-const MATCH_DETAILS_CONCURRENCY: usize = 2;
 
 /// Phase 1 of the burst: resolve names (batch) + MMR (per player) into the cache,
 /// fetching only the puuids not already cached from a same-match pregame build (HIGH-1
@@ -1983,30 +2029,39 @@ async fn fetch_phase1(
         progress.publish_progress(cache, true);
     }
 
-    // MMR: per player, only the ones missing, spaced between requests.
+    // MMR: per player, only the ones missing — batched concurrently with adaptive rate limiting.
     let missing_mmr: Vec<String> = puuids
         .iter()
         .filter(|p| !cache.mmr.contains_key(*p))
         .cloned()
         .collect();
     vlt_log!("enrich", "phase1: {} mmr to fetch", missing_mmr.len());
-    for (i, puuid) in missing_mmr.iter().enumerate() {
-        if i > 0 {
-            tokio::time::sleep(inter_request_delay()).await;
+    let mut sent_any = false;
+    for chunk in missing_mmr.chunks(MMR_CONCURRENCY) {
+        if drain_pokes(progress.ctx.rx) {
+            return Ok(false);
         }
-        let Some(result) =
-            until_poke(progress.ctx.rx, with_rate_limit_retry(gate, || remote.mmr(puuid))).await
-        else {
+        if sent_any {
+            tokio::time::sleep(inter_request_delay(gate)).await;
+        }
+        sent_any = true;
+        gate.record_requests(chunk.len());
+        let downloads = chunk
+            .iter()
+            .map(|puuid| with_rate_limit_retry(gate, || remote.mmr(puuid)));
+        let Some(results) = until_poke(progress.ctx.rx, join_all(downloads)).await else {
             return Ok(false);
         };
-        match result {
-            Ok(v) => {
-                cache.mmr.insert(puuid.clone(), parse_mmr(v));
-                progress.publish_progress(cache, false);
+        for (puuid, result) in chunk.iter().zip(results) {
+            match result {
+                Ok(v) => {
+                    cache.mmr.insert(puuid.clone(), parse_mmr(v));
+                }
+                Err(e) if warrants_token_refresh(&e) => return Err(e),
+                Err(_) => { /* private profile / hiccup -> Unranked for this row only */ }
             }
-            Err(e) if warrants_token_refresh(&e) => return Err(e),
-            Err(_) => { /* private profile / hiccup -> Unranked for this row only */ }
         }
+        progress.publish_progress(cache, false);
     }
     Ok(true)
 }
@@ -2055,45 +2110,46 @@ async fn fetch_phase2(
     // whatever arrived.
     let last_attempt = enrichment_is_final(false, cache.phase2_attempts + 1);
 
-    // competitiveupdates: one request per player missing history.
+    // competitiveupdates: one request per player missing history — batched concurrently.
     let missing_updates: Vec<String> = puuids
         .iter()
         .filter(|p| !cache.updates.contains_key(*p))
         .cloned()
         .collect();
-    for puuid in &missing_updates {
+    for chunk in missing_updates.chunks(COMPETITIVE_CONCURRENCY) {
         if drain_pokes(progress.ctx.rx) {
             return Ok(Phase2Outcome::Interrupted);
         }
         if sent_any {
-            tokio::time::sleep(inter_request_delay()).await;
+            tokio::time::sleep(inter_request_delay(gate)).await;
         }
         sent_any = true;
-        let Some(result) = until_poke(
-            progress.ctx.rx,
-            with_rate_limit_retry(gate, || remote.competitive_updates(puuid)),
-        )
-        .await
-        else {
+        gate.record_requests(chunk.len());
+        let downloads = chunk
+            .iter()
+            .map(|puuid| with_rate_limit_retry(gate, || remote.competitive_updates(puuid)));
+        let Some(results) = until_poke(progress.ctx.rx, join_all(downloads)).await else {
             return Ok(Phase2Outcome::Interrupted);
         };
-        match result {
-            Ok(v) => {
-                let mut history = stats::parse_competitive_updates(v);
-                if history.recent_match_ids.is_empty() {
-                    // Casual/Premier player with no competitive history in current window:
-                    // query general match history so HS% and KD can still be computed.
-                    if let Ok(hist_val) = with_rate_limit_retry(gate, || remote.match_history(puuid)).await {
-                        history.recent_match_ids = stats::parse_match_history_ids(hist_val);
+        for (puuid, result) in chunk.iter().zip(results) {
+            match result {
+                Ok(v) => {
+                    let mut history = stats::parse_competitive_updates(v);
+                    if history.recent_match_ids.is_empty() {
+                        // Casual/Premier player with no competitive history in current window:
+                        // query general match history so HS% and KD can still be computed.
+                        if let Ok(hist_val) = with_rate_limit_retry(gate, || remote.match_history(puuid)).await {
+                            history.recent_match_ids = stats::parse_match_history_ids(hist_val);
+                        }
                     }
+                    cache.updates.insert(puuid.clone(), history);
                 }
-                cache.updates.insert(puuid.clone(), history);
-                progress.publish_progress(cache, false);
+                Err(Error::BadClaims) => return Err(Error::BadClaims),
+                // Transient: leave the entry unset so the retry refetches this player only.
+                Err(_) => partial = true,
             }
-            Err(Error::BadClaims) => return Err(Error::BadClaims),
-            // Transient: leave the entry unset so the retry refetches this player only.
-            Err(_) => partial = true,
         }
+        progress.publish_progress(cache, false);
     }
 
     // HS% + KD: up to RECENT_MATCHES_FOR_HS match-details per player missing them,
@@ -2145,9 +2201,10 @@ async fn fetch_phase2(
                 return Ok(Phase2Outcome::Interrupted);
             }
             if sent_any {
-                tokio::time::sleep(inter_request_delay()).await;
+                tokio::time::sleep(inter_request_delay(gate)).await;
             }
             sent_any = true;
+            gate.record_requests(batch.len());
             let downloads = batch
                 .iter()
                 .map(|mid| with_rate_limit_retry(gate, || remote.match_details(mid)));
@@ -2204,6 +2261,11 @@ async fn fetch_phase2(
         if drain_pokes(progress.ctx.rx) {
             return Ok(Phase2Outcome::Interrupted);
         }
+        if sent_any {
+            tokio::time::sleep(inter_request_delay(gate)).await;
+        }
+        sent_any = true;
+        gate.record_requests(1);
         let Some(result) = until_poke(
             progress.ctx.rx,
             with_rate_limit_retry(gate, || remote.coregame_loadouts(match_id)),

@@ -188,13 +188,20 @@ pub const RECENT_MATCHES_FOR_HS: usize = 5;
 /// Number of W/L pips shown for the "last games" column.
 pub const RECENT_RESULTS_COUNT: usize = 5;
 
+/// How many match-details downloads to send concurrently per batch.
+pub const MATCH_DETAILS_CONCURRENCY: usize = 4;
+
+/// How many MMR or competitiveupdates requests to run concurrently per batch.
+pub const MMR_CONCURRENCY: usize = 4;
+pub const COMPETITIVE_CONCURRENCY: usize = 4;
+
 /// `endIndex` for the competitiveupdates request (a small window covering ΔRR + pips +
 /// the match ids HS% reuses). Matches the live probe.
 pub const COMPETITIVE_UPDATES_END_INDEX: u32 = 10;
 
-/// Small delay between the burst of per-player stat requests at match start, to stay
+/// Small delay between batches of per-player stat requests at match start, to stay
 /// under Riot's rate limit alongside the existing 429 retry. Milliseconds.
-pub const INTER_REQUEST_DELAY_MS: u64 = 120;
+pub const INTER_REQUEST_DELAY_MS: u64 = 80;
 
 /// Map region -> pd/glz shard. shard == region except latam/br -> na; pbe -> na.
 /// (Inferred from valclient.py + vRY's pbe special-case; see spec gaps.)
